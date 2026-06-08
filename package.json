@@ -1,0 +1,16 @@
+{
+  "name": "temu-price-dashboard",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "init:db": "node scripts/init_db.js",
+    "import:db": "node scripts/import_dashboard_snapshot.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "mysql2": "^3.15.3"
+  },
+  "devDependencies": {
+    "xlsx": "^0.18.5"
+  }
+}

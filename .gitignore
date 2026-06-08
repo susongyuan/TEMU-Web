@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.server.example
+data/
+logs/
+.runtime/
+*.log
+*.tmp

@@ -1,0 +1,49 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: temu-monitor-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${DB_NAME:-temu_monitor}
+      MYSQL_USER: ${DB_USER:-temu_app}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+    ports:
+      - "${MYSQL_BIND_HOST:-127.0.0.1}:${MYSQL_PUBLIC_PORT:-3306}:3306"
+    volumes:
+      - temu_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  temu-price-dashboard:
+    build: .
+    image: temu-price-dashboard:latest
+    container_name: temu-price-dashboard
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3106}:3106"
+    environment:
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 3106
+      DATA_SOURCE: db
+      ENABLE_LOCAL_REFRESH: "false"
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DB_USER:-temu_app}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_NAME: ${DB_NAME:-temu_monitor}
+
+volumes:
+  temu_mysql_data:

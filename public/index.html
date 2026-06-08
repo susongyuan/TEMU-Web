@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TEMU 运营看板</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">TEMU 运营看板</h1>
+        <div id="updateStatus" class="update-status">读取数据中</div>
+        <p id="sourceLine">读取数据中</p>
+      </div>
+      <div class="top-actions">
+        <a id="priceNav" class="nav-link" href="/price">价格同步</a>
+        <a id="inventoryNav" class="nav-link" href="/inventory">库存上下架</a>
+        <button id="refreshBtn" type="button">刷新数据</button>
+        <button id="runFetchBtn" type="button">同步更新领星+库存</button>
+        <button id="runInventoryBtn" type="button">仅刷新库存</button>
+        <button id="exportBtn" type="button" class="secondary">导出当前筛选</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="metricGrid" class="metrics" aria-label="汇总指标"></section>
+
+      <section class="filters" aria-label="筛选">
+        <div class="quick-search">
+          <input id="searchInput" type="search" placeholder="搜索标题 / SKU / 店铺 / SPU" />
+          <button id="clearFiltersBtn" type="button" class="secondary">清空筛选</button>
+          <span id="resultCount" class="result-count">0 / 0</span>
+        </div>
+        <div id="filterGrid" class="filter-grid"></div>
+      </section>
+
+      <section class="table-shell">
+        <table>
+          <thead id="tableHead"></thead>
+          <tbody id="tableBody">
+            <tr>
+              <td class="empty">读取数据中</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
