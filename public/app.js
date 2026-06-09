@@ -235,6 +235,47 @@ function text(value) {
   return String(value ?? '').trim();
 }
 
+function compactSearchText(value) {
+  return text(value).toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '');
+}
+
+function searchTextForRow(row) {
+  const fields = [
+    'platformSpu',
+    'spuId',
+    'skcId',
+    'skuId',
+    'skuCode',
+    'listingSkuCodes',
+    'listingStockedSkuCodes',
+    'listingSkuDetails',
+    'skuName',
+    'title',
+    'officialTitle',
+    'owner',
+    'ownerStatus',
+    'ownerMatchText',
+    'storeName',
+    'storeRegion',
+    'area',
+    'site',
+    'regionGroup',
+    'mallId',
+    'goodsId',
+    'warehouseSku',
+    'warehouse',
+    'inventoryAlertReason'
+  ];
+  const explicitValues = fields.map(field => row[field]);
+  const values = [...explicitValues, ...Object.values(row)]
+    .flatMap(value => Array.isArray(value) ? value : [value])
+    .map(value => text(value))
+    .filter(Boolean);
+  const plain = values.join(' ').toLowerCase();
+  const compact = values.map(compactSearchText).filter(Boolean).join(' ');
+  return { plain, compact };
+}
+
 function escapeHtml(value) {
   return text(value)
     .replace(/&/g, '&amp;')
@@ -432,7 +473,13 @@ function selectedLabel(def, options) {
 
 function rowMatchesKeyword(row, keyword) {
   if (!keyword) return true;
-  return Object.values(row).join(' ').toLowerCase().includes(keyword);
+  const tokens = text(keyword).toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return true;
+  const searchable = searchTextForRow(row);
+  return tokens.every(token => {
+    const compactToken = compactSearchText(token);
+    return searchable.plain.includes(token) || (compactToken && searchable.compact.includes(compactToken));
+  });
 }
 
 function rowMatchesFilters(row, excludeFilterId = '') {
