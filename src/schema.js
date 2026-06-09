@@ -47,6 +47,20 @@ async function initDashboardSchema(db) {
       KEY idx_sync_runs_source_started (source, started_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_row_actions (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      mode VARCHAR(32) NOT NULL,
+      row_key VARCHAR(255) NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT '未处理',
+      updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_dashboard_row_actions_mode_key (mode, row_key),
+      KEY idx_dashboard_row_actions_mode_status (mode, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
 }
 
 module.exports = {

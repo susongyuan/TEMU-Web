@@ -610,6 +610,13 @@ tr.row-warn:hover td {
   max-width: 11rem;
 }
 
+.col-manualProcessStatus {
+  width: 7.5rem;
+  min-width: 7.5rem;
+  max-width: 7.5rem;
+  text-align: center;
+}
+
 .col-inventoryAlertReason {
   width: 26rem;
   min-width: 26rem;
@@ -694,7 +701,7 @@ tr.row-warn:hover td {
 }
 
 body[data-page="inventory"] table {
-  min-width: 286rem;
+  min-width: 294rem;
 }
 
 body[data-page="price"] table {
@@ -757,6 +764,36 @@ td.col-listingSkuInventory .multi-cell {
   white-space: normal;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.manual-status-toggle {
+  width: 100%;
+  min-height: 2rem;
+  padding: 0 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.manual-status-toggle.is-pending {
+  border-color: #efc37a;
+  background: #fff7e8;
+  color: var(--warning);
+}
+
+.manual-status-toggle.is-pending:hover {
+  background: #ffedc4;
+}
+
+.manual-status-toggle.is-done {
+  border-color: #b8ddd7;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.manual-status-toggle.is-done:hover {
+  background: #d4ece8;
 }
 
 th.col-site,

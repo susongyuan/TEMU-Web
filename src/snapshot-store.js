@@ -11,19 +11,26 @@ function parseJson(value, fallback) {
 }
 
 function rowKey(row, index) {
-  const parts = [
+  const stableParts = [
     row.platformSpu,
     row.spuId,
-    row.skuId,
+    row.storeRegion,
+    row.storeName,
+    row.area,
+    row.regionGroup,
     row.skcId,
+    row.skuId,
+    row.listingSkuCodes,
     row.skuCode,
     row.mallId,
     row.goodsId,
-    row.id
+    row.stockAction,
+    row.priceAlert
   ]
     .map(value => String(value || '').trim())
     .filter(Boolean);
-  return (parts.join('|') || `row-${index}`).slice(0, 255);
+  if (stableParts.length) return stableParts.join('|').slice(0, 255);
+  return (String(row.id || '').trim() || `row-${index}`).slice(0, 255);
 }
 
 async function insertRows(connection, snapshotId, mode, rows) {
@@ -107,6 +114,7 @@ async function saveDashboardSnapshot(data) {
 
 async function loadDashboardSnapshot(mode) {
   const pool = getPool();
+  await initDashboardSchema(pool);
 
   const [snapshots] = await pool.execute(
     `SELECT id, mode, generated_at, row_count,
@@ -129,19 +137,103 @@ async function loadDashboardSnapshot(mode) {
   const snapshot = snapshots[0];
   const [dbRows] = await pool.execute(
     `SELECT CAST(row_json AS CHAR) AS row_json
+       , row_key
      FROM dashboard_rows
      WHERE snapshot_id = ?
      ORDER BY row_index ASC`,
     [snapshot.id]
   );
+  const parsedRows = dbRows.map((row, index) => {
+    const parsed = parseJson(row.row_json, {});
+    return {
+      ...parsed,
+      _rowKey: rowKey(parsed, index)
+    };
+  });
+  const actionMap = await loadRowActions(pool, mode, parsedRows.map(row => row._rowKey));
+  const rows = parsedRows.map(row => withManualActionStatus(mode, row, actionMap.get(row._rowKey)));
+  const summary = {
+    ...parseJson(snapshot.summary_json, {}),
+    manual_actionable_rows: rows.filter(row => row.manualActionable === '是').length,
+    manual_pending_rows: rows.filter(row => row.manualProcessStatus === '未处理').length,
+    manual_done_rows: rows.filter(row => row.manualProcessStatus === '已完成').length
+  };
 
   return {
     generated_at: snapshot.generated_at,
     mode: snapshot.mode,
     sources: parseJson(snapshot.sources_json, {}),
-    summary: parseJson(snapshot.summary_json, {}),
-    rows: dbRows.map(row => parseJson(row.row_json, {}))
+    summary,
+    rows
   };
+}
+
+async function loadRowActions(pool, mode, rowKeys) {
+  const keys = [...new Set(rowKeys.filter(Boolean))];
+  const actions = new Map();
+  if (!keys.length) return actions;
+  for (let start = 0; start < keys.length; start += INSERT_BATCH_SIZE) {
+    const batch = keys.slice(start, start + INSERT_BATCH_SIZE);
+    const placeholders = batch.map(() => '?').join(',');
+    const [rows] = await pool.execute(
+      `SELECT row_key, status, updated_at
+       FROM dashboard_row_actions
+       WHERE mode = ? AND row_key IN (${placeholders})`,
+      [mode, ...batch]
+    );
+    for (const row of rows) {
+      actions.set(row.row_key, {
+        status: row.status,
+        updatedAt: row.updated_at
+      });
+    }
+  }
+  return actions;
+}
+
+function isManualActionable(mode, row) {
+  if (mode === 'inventory') {
+    const action = String(row.stockAction || '').trim();
+    return Boolean(action && action !== '正常');
+  }
+  if (mode === 'price') {
+    const alert = String(row.priceAlert || '').trim();
+    return Boolean(alert && alert !== '价格一致');
+  }
+  return false;
+}
+
+function withManualActionStatus(mode, row, savedAction) {
+  const actionable = isManualActionable(mode, row);
+  const savedStatus = String(savedAction?.status || '').trim();
+  const manualProcessStatus = actionable
+    ? (savedStatus === '已完成' ? '已完成' : '未处理')
+    : '无需处理';
+  return {
+    ...row,
+    manualActionable: actionable ? '是' : '否',
+    manualProcessStatus,
+    manualActionUpdatedAt: savedAction?.updatedAt || ''
+  };
+}
+
+async function setRowActionStatus({ mode, rowKey: key, status }) {
+  const normalizedMode = String(mode || '').trim();
+  const normalizedKey = String(key || '').trim();
+  const normalizedStatus = String(status || '').trim();
+  if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
+  if (!normalizedKey) throw new Error('rowKey 不能为空');
+  if (!['未处理', '已完成'].includes(normalizedStatus)) throw new Error('处理状态无效');
+
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  await pool.execute(
+    `INSERT INTO dashboard_row_actions (mode, row_key, status)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE status = VALUES(status), updated_at = CURRENT_TIMESTAMP(3)`,
+    [normalizedMode, normalizedKey, normalizedStatus]
+  );
+  return { mode: normalizedMode, rowKey: normalizedKey, status: normalizedStatus };
 }
 
 async function listSnapshotStatus() {
@@ -157,5 +249,7 @@ async function listSnapshotStatus() {
 module.exports = {
   listSnapshotStatus,
   loadDashboardSnapshot,
-  saveDashboardSnapshot
+  rowKey,
+  saveDashboardSnapshot,
+  setRowActionStatus
 };

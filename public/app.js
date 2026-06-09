@@ -128,6 +128,8 @@ const PAGE_CONFIG = {
       ['inventory_rows', '库存核对行'],
       ['inventory_alert_rows', '强提醒', 'danger'],
       ['action_required_rows', '需处理', 'warn'],
+      ['manual_pending_rows', '未处理', 'warn'],
+      ['manual_done_rows', '已完成'],
       ['active_listing_no_available_stock_rows', '在卖无可用库存', 'danger'],
       ['no_active_listing_with_stock_rows', '有库存无在卖', 'warn'],
       ['other_region_stock_rows', '其他区域有库存']
@@ -143,6 +145,7 @@ const PAGE_CONFIG = {
       { id: 'regionGroup', label: '区域组', kind: 'fixed', options: ['美国/Global', '欧区'] },
       { id: 'status', label: '领星状态', kind: 'field' },
       { id: 'stockAction', label: '处理动作', kind: 'fixed', options: ['有在卖但没可用库存', '有库存但无在卖链接', '库存源异常', '正常'] },
+      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未处理', '已完成', '无需处理'] },
       { id: 'warehouseRegionMatchStatus', label: '仓库地区', kind: 'fixed', options: ['同区匹配', '其他区域有库存', '无库存记录'] },
       { id: 'warehouseSource', label: '仓库来源', kind: 'splitField' }
     ],
@@ -155,6 +158,7 @@ const PAGE_CONFIG = {
       ['listingPriceDetails', '申报价/活动价', priceDetailsCell],
       ['skuRegionLingxingStatuses', '链接SKU状态', statusSummaryCell],
       ['stockAction', '处理动作', stockActionCell],
+      ['manualProcessStatus', '处理状态', manualProcessStatusCell],
       ['skuName', '品名/SKU'],
       ['owner', '负责人'],
       ['title', '标题', titleCell],
@@ -194,6 +198,8 @@ const PAGE_CONFIG = {
       ['title', '标题'],
       ['image', '图片'],
       ['stockAction', '处理动作'],
+      ['manualProcessStatus', '处理状态'],
+      ['manualActionUpdatedAt', '处理时间'],
       ['inventoryAlertReason', '提醒原因'],
       ['skuRegionAlertRepresentative', '提醒代表行'],
       ['hasInventoryButOffShelf', '有库存但无在卖链接'],
@@ -264,7 +270,8 @@ function searchTextForRow(row) {
     'goodsId',
     'warehouseSku',
     'warehouse',
-    'inventoryAlertReason'
+    'inventoryAlertReason',
+    'manualProcessStatus'
   ];
   const explicitValues = fields.map(field => row[field]);
   const values = [...explicitValues, ...Object.values(row)]
@@ -753,6 +760,22 @@ function stockActionCell(row) {
   return pill(row.stockAction);
 }
 
+function manualProcessStatusCell(row) {
+  const status = text(row.manualProcessStatus || '无需处理');
+  if (status === '无需处理' || row.manualActionable !== '是') return pill('无需处理', 'muted-pill');
+  const nextStatus = status === '已完成' ? '未处理' : '已完成';
+  const tone = status === '已完成' ? 'is-done' : 'is-pending';
+  return `
+    <button
+      type="button"
+      class="manual-status-toggle ${tone}"
+      data-row-key="${escapeHtml(row._rowKey)}"
+      data-current-status="${escapeHtml(status)}"
+      title="点击标记为${escapeHtml(nextStatus)}"
+    >${escapeHtml(status)}</button>
+  `;
+}
+
 function referencePriceCell(row) {
   return `${escapeHtml(row.referencePrice)} <span class="muted">${escapeHtml(row.referencePriceType)}</span>`;
 }
@@ -837,6 +860,36 @@ function handleFilterInput(event) {
   }
 }
 
+async function updateManualProcessStatus(button) {
+  const rowKey = button.dataset.rowKey;
+  const currentStatus = button.dataset.currentStatus;
+  const nextStatus = currentStatus === '已完成' ? '未处理' : '已完成';
+  if (!rowKey) return;
+  button.disabled = true;
+  button.textContent = '保存中';
+  try {
+    const response = await fetch('/api/action-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: PAGE, rowKey, status: nextStatus })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '处理状态保存失败');
+    await loadData();
+  } catch (error) {
+    alert(error.message);
+    button.disabled = false;
+    button.textContent = currentStatus;
+  }
+}
+
+function handleTableClick(event) {
+  const button = event.target.closest('.manual-status-toggle');
+  if (button) {
+    updateManualProcessStatus(button);
+  }
+}
+
 function clearFilters() {
   state.filters.forEach(selected => selected.clear());
   els.searchInput.value = '';
@@ -912,6 +965,7 @@ loadHealth();
 els.searchInput.addEventListener('input', applyFilters);
 els.filterGrid.addEventListener('click', handleFilterClick);
 els.filterGrid.addEventListener('input', handleFilterInput);
+els.tableBody.addEventListener('click', handleTableClick);
 document.addEventListener('click', event => {
   if (!event.target.closest('.filter-menu')) closeFilterMenus();
 });

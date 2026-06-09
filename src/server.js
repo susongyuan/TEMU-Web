@@ -2,7 +2,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const express = require('express');
 const { ensureEnvLoaded } = require('./env');
-const { loadDashboardSnapshot, listSnapshotStatus } = require('./snapshot-store');
+const { loadDashboardSnapshot, listSnapshotStatus, setRowActionStatus } = require('./snapshot-store');
 
 ensureEnvLoaded();
 
@@ -152,6 +152,24 @@ app.post('/api/refresh/inventory', (req, res) => {
   });
 
   res.json({ data: { started: true, runner: WAREHOUSE_RUNNER } });
+});
+
+app.post('/api/action-status', async (req, res) => {
+  try {
+    const result = await setRowActionStatus({
+      mode: req.body?.mode,
+      rowKey: req.body?.rowKey,
+      status: req.body?.status
+    });
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'ACTION_STATUS_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
 });
 
 app.use((req, res) => {
