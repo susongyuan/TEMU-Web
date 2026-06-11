@@ -14,6 +14,7 @@ const LINGXING_PRICE_CSV = path.join(INPUT_DIR, `${LINGXING_PRICE_BASENAME}.csv`
 const LINGXING_INVENTORY_CSV = path.join(INPUT_DIR, `${LINGXING_INVENTORY_BASENAME}.csv`);
 const WAREHOUSE_INVENTORY_CSV = path.join(WAREHOUSE_DATA_DIR, 'warehouse_inventory_latest.csv');
 const SKU_OWNER_FILES = [
+  path.join(APP_DIR, 'input', '平台SKU_1781161550125.xlsx'),
   path.join(APP_DIR, 'input', 'SKU-运营映射表.xlsx'),
   path.join(INPUT_DIR, 'SKU-运营映射表.xlsx')
 ];
@@ -165,6 +166,70 @@ function normalizeKey(value) {
   return normalizeText(value).replace(/[^\p{Letter}\p{Number}]+/gu, '');
 }
 
+const EU_SITE_CODES = new Set(['DE', 'UK', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'IE', 'PL', 'SE', 'CZ']);
+const GLOBAL_SITE_CODES = new Set(['US', 'AU', 'CA', 'JP', 'AM', 'QT']);
+
+function ownerStoreInfo(value) {
+  const source = String(value || '').trim();
+  if (!source) return { tokens: [], region: '' };
+  let code = source.replace(/^temu[_\s-]*/i, '').trim();
+  const parts = code.split(/[_\s-]+/).filter(Boolean);
+  let region = '';
+  if (parts.length) {
+    const suffix = parts[parts.length - 1].toUpperCase();
+    if (EU_SITE_CODES.has(suffix) || suffix === 'EU') {
+      region = 'eu';
+      parts.pop();
+    } else if (GLOBAL_SITE_CODES.has(suffix)) {
+      region = 'global';
+      parts.pop();
+    }
+  }
+  const tokenValues = [parts.join(''), parts[parts.length - 1], code, source];
+  return {
+    tokens: [...new Set(tokenValues.map(normalizeKey).filter(Boolean))],
+    region
+  };
+}
+
+function rowStoreTokens(row = {}) {
+  const source = String(row.storeName || row.store || row.mallName || '').trim();
+  if (!source) return [];
+  const storeOnly = source
+    .split(/\s+\/\s+/)[0]
+    .replace(/[（(][^）)]*[）)]/g, '')
+    .replace(/[-_\s]*(美[，,]?\s*全球|美国\s*\/?\s*global|欧区|欧洲|EU|AM|QT)\s*$/i, '')
+    .trim();
+  const tokenValues = [storeOnly, storeOnly.split(/[-_\s]+/)[0], source];
+  return [...new Set(tokenValues.map(normalizeKey).filter(Boolean))];
+}
+
+function rowRegionGroup(row = {}) {
+  const primary = `${row.storeName || ''} ${row.area || ''} ${row.regionGroup || ''}`;
+  if (/欧区|欧洲|\bEU\b|\bDE\b|\bUK\b|\bFR\b|\bIT\b|\bES\b/i.test(primary)) return 'eu';
+  if (/美|美国|全球|Global|\bUS\b|\bAM\b|\bQT\b/i.test(primary)) return 'global';
+  const site = String(row.site || '').trim().toUpperCase();
+  if (EU_SITE_CODES.has(site) || site === 'EU') return 'eu';
+  if (GLOBAL_SITE_CODES.has(site)) return 'global';
+  return '';
+}
+
+function storeSkuKey(storeToken, region, skuKey) {
+  return [storeToken, region || '*', skuKey].join('|');
+}
+
+function excludedStoreNames() {
+  return String(process.env.EXCLUDED_STORE_NAMES || 'Broadure,Broadure-EU,guangyd,guangyd-EU')
+    .split(',')
+    .map(item => normalizeKey(item))
+    .filter(Boolean);
+}
+
+function isExcludedStoreName(value) {
+  const key = normalizeKey(value);
+  return Boolean(key && excludedStoreNames().includes(key));
+}
+
 function pick(row, names) {
   for (const name of names) {
     if (row[name] !== undefined && row[name] !== null && row[name] !== '') return String(row[name]);
@@ -295,10 +360,11 @@ function addToArrayMap(map, key, value) {
   map.get(key).push(value);
 }
 
-function ownerMatchCacheKey(skuValues, nameValues) {
+function ownerMatchCacheKey(skuValues, nameValues, rowContext = {}) {
   return [
     skuValues.map(value => String(value || '').trim()).join('\u001f'),
-    nameValues.map(value => String(value || '').trim()).join('\u001f')
+    nameValues.map(value => String(value || '').trim()).join('\u001f'),
+    [rowContext.storeName || '', rowContext.area || '', rowContext.site || '', rowContext.regionGroup || ''].join('\u001f')
   ].join('\u001e');
 }
 
@@ -328,6 +394,28 @@ function collectOwnersBySku(skuValues, ownerIndex, keyForSku) {
     for (const sku of extractSkuCodes(value)) {
       const owner = ownerIndex.get(keyForSku(sku));
       if (owner) addOwnerResult(owners, seen, owner);
+    }
+  }
+  return owners;
+}
+
+function collectOwnersByStoreSku(skuValues, ownerIndex, rowContext = {}) {
+  const owners = [];
+  const seen = new Set();
+  const storeTokens = rowStoreTokens(rowContext);
+  if (!storeTokens.length) return owners;
+  const region = rowRegionGroup(rowContext);
+  for (const value of skuValues) {
+    for (const sku of extractSkuCodes(value)) {
+      const skuKeys = [normalizeKey(sku), skuPrefix(sku)].filter(Boolean);
+      for (const storeToken of storeTokens) {
+        for (const skuKey of skuKeys) {
+          for (const regionKey of [region, '*'].filter(Boolean)) {
+            const owner = ownerIndex.byStoreSku?.get(storeSkuKey(storeToken, regionKey, skuKey));
+            if (owner) addOwnerResult(owners, seen, owner);
+          }
+        }
+      }
     }
   }
   return owners;
@@ -392,10 +480,17 @@ function fuzzyOwnerByProductName(skuValues, nameValues, ownerIndex) {
   return ownerResult([...bestOwners], '模糊产品名', `${Math.round(bestScore * 100)}%`);
 }
 
-function ownerMatchForSkuValues(skuValues, ownerIndex, nameValues = []) {
+function ownerMatchForSkuValues(skuValues, ownerIndex, nameValues = [], rowContext = {}) {
   if (!ownerIndex.ownerMatchCache) ownerIndex.ownerMatchCache = new Map();
-  const matchCacheKey = ownerMatchCacheKey(skuValues, nameValues);
+  const matchCacheKey = ownerMatchCacheKey(skuValues, nameValues, rowContext);
   if (ownerIndex.ownerMatchCache.has(matchCacheKey)) return ownerIndex.ownerMatchCache.get(matchCacheKey);
+
+  const storeSkuOwners = collectOwnersByStoreSku(skuValues, ownerIndex, rowContext);
+  if (storeSkuOwners.length) {
+    const result = ownerResult(storeSkuOwners, '店铺SKU');
+    ownerIndex.ownerMatchCache.set(matchCacheKey, result);
+    return result;
+  }
 
   const exactOwners = collectOwnersBySku(skuValues, ownerIndex, sku => normalizeKey(sku));
   if (exactOwners.length) {
@@ -423,12 +518,12 @@ function ownerMatchForSkuValues(skuValues, ownerIndex, nameValues = []) {
   return result;
 }
 
-function ownerTextForSkuValues(skuValues, ownerIndex, nameValues = []) {
-  return ownerMatchForSkuValues(skuValues, ownerIndex, nameValues).owner;
+function ownerTextForSkuValues(skuValues, ownerIndex, nameValues = [], rowContext = {}) {
+  return ownerMatchForSkuValues(skuValues, ownerIndex, nameValues, rowContext).owner;
 }
 
 function skuOwnerFile() {
-  return newest(SKU_OWNER_FILES);
+  return SKU_OWNER_FILES.find(file => fs.existsSync(file)) || '';
 }
 
 function loadSkuOwnerIndex() {
@@ -439,28 +534,57 @@ function loadSkuOwnerIndex() {
   }
 
   const index = new Map();
+  const exactOwners = new Map();
+  const storeSkuOwners = new Map();
   const prefixOwners = new Map();
   const productNameOwners = new Map();
   const fuzzyProductNames = [];
   const fuzzySeen = new Set();
   for (const row of readWorkbookRows(file)) {
-    const sku =
+    const platform = pickByNormalizedHeader(row, ['平台', 'platform']) || pick(row, ['平台', 'platform']);
+    if (platform && !/temu/i.test(platform)) continue;
+    const skuValues = [
+      pickByNormalizedHeader(row, ['平台sku', '平台SKU', '平台商品SKU', 'seller sku', 'seller_sku']) ||
+        pick(row, ['平台sku', '平台SKU', '平台商品SKU', 'seller sku', 'seller_sku']),
+      pickByNormalizedHeader(row, ['主SKU', '主sku', 'main sku', 'main_sku']) ||
+        pick(row, ['主SKU', '主sku', 'main sku', 'main_sku']),
       pickByNormalizedHeader(row, ['SKU', '系统SKU', '产品代码', '仓库产品代码', 'sku']) ||
-      pick(row, ['SKU', '系统SKU', '产品代码', '仓库产品代码', 'sku']);
+        pick(row, ['SKU', '系统SKU', '产品代码', '仓库产品代码', 'sku'])
+    ].filter(Boolean);
     const owner =
       pickByNormalizedHeader(row, ['负责人', '销售负责人', '运营', '运营负责人']) ||
       pick(row, ['负责人', '销售负责人', '运营', '运营负责人']);
     const productName =
       pickByNormalizedHeader(row, ['产品名称', '中文名称', '品名', '商品名称', '产品中文名']) ||
       pick(row, ['产品名称', '中文名称', '品名', '商品名称', '产品中文名']);
+    const storeInfo = ownerStoreInfo(
+      pickByNormalizedHeader(row, ['店铺code', '店铺代码', '店铺', '店铺名', 'store code', 'store_code', 'store']) ||
+        pick(row, ['店铺code', '店铺代码', '店铺', '店铺名', 'store code', 'store_code', 'store'])
+    );
     const cleanedOwner = cleanOwnerItems(owner).join('；');
-    if (!sku || !cleanedOwner) continue;
+    if (!skuValues.length || !cleanedOwner) continue;
     const skuPrefixes = new Set();
-    for (const item of extractSkuCodes(sku)) {
-      const key = normalizeKey(item);
-      if (key && !index.has(key)) index.set(key, cleanedOwner);
-      addOwnerToSetMap(prefixOwners, skuPrefix(item), cleanedOwner);
-      if (skuPrefix(item)) skuPrefixes.add(skuPrefix(item));
+    for (const sku of skuValues) {
+      const skuText = String(sku || '').trim();
+      const directKey = normalizeKey(skuText);
+      addOwnerToSetMap(exactOwners, directKey, cleanedOwner);
+      for (const item of extractSkuCodes(skuText)) {
+        const key = normalizeKey(item);
+        addOwnerToSetMap(exactOwners, key, cleanedOwner);
+        addOwnerToSetMap(prefixOwners, skuPrefix(item), cleanedOwner);
+        if (skuPrefix(item)) skuPrefixes.add(skuPrefix(item));
+        for (const storeToken of storeInfo.tokens) {
+          if (key) {
+            addOwnerToSetMap(storeSkuOwners, storeSkuKey(storeToken, storeInfo.region, key), cleanedOwner);
+            addOwnerToSetMap(storeSkuOwners, storeSkuKey(storeToken, '*', key), cleanedOwner);
+          }
+          const prefix = skuPrefix(item);
+          if (prefix) {
+            addOwnerToSetMap(storeSkuOwners, storeSkuKey(storeToken, storeInfo.region, prefix), cleanedOwner);
+            addOwnerToSetMap(storeSkuOwners, storeSkuKey(storeToken, '*', prefix), cleanedOwner);
+          }
+        }
+      }
     }
     for (const name of splitProductNameValues(productName)) {
       for (const key of productNameKeys(name)) {
@@ -478,6 +602,8 @@ function loadSkuOwnerIndex() {
       }
     }
   }
+  for (const [key, owner] of uniqueOwnerMap(exactOwners).entries()) index.set(key, owner);
+  index.byStoreSku = uniqueOwnerMap(storeSkuOwners);
   index.bySkuPrefix = uniqueOwnerMap(prefixOwners);
   index.byProductName = uniqueOwnerMap(productNameOwners);
   index.fuzzyProductNames = fuzzyProductNames;
@@ -536,9 +662,20 @@ function statusText(status) {
   return STATUS_MAP[value] || value;
 }
 
+function configuredActiveStatusCodes() {
+  return new Set(
+    String(process.env.LINGXING_ACTIVE_STATUS_CODES || '12')
+      .split(/[，,\s]+/)
+      .map(item => item.trim())
+      .filter(Boolean)
+  );
+}
+
 function isActiveStatus(status) {
+  const code = statusCode(status);
+  if (code && configuredActiveStatusCodes().has(code)) return true;
   const value = statusText(status);
-  return value === '已加入站点' || value === '在售' || value === '已上架';
+  return value === '在售' || value === '已上架';
 }
 
 function priceForSku(product, skuCode, field) {
@@ -653,15 +790,16 @@ function normalizeOfficial(rows) {
 
 function readLingxing(baseName, standardCsv) {
   const rawFile = findLatestLingxingRaw(baseName);
+  const filterRows = rows => rows.filter(row => !isExcludedStoreName(row.storeName));
   if (rawFile) {
     const products = JSON.parse(fs.readFileSync(rawFile, 'utf8'));
     return {
-      rows: normalizeLingxingRaw(Array.isArray(products) ? products : []),
+      rows: filterRows(normalizeLingxingRaw(Array.isArray(products) ? products : [])),
       source: fileInfo(rawFile)
     };
   }
   return {
-    rows: normalizeLingxingSheet(readSheet(standardCsv)),
+    rows: filterRows(normalizeLingxingSheet(readSheet(standardCsv))),
     source: fileInfo(standardCsv)
   };
 }
@@ -738,7 +876,7 @@ function priceStatus(row) {
 function fromLingxingPrice(row, official, matchStatus, index, ownerIndex) {
   const ref = referencePrice(row);
   const status = priceStatus({ ...row, officialPrice: official?.officialPrice || '' });
-  const ownerMatch = ownerMatchForSkuValues([row.skuCode], ownerIndex, [row.skuName, row.title]);
+  const ownerMatch = ownerMatchForSkuValues([row.skuCode], ownerIndex, [row.skuName, row.title], row);
   return {
     id: `price-lx-${row.platformSpu || 'spu'}-${row.skcId || row.skuId || index}`,
     sourceSide: '领星',
@@ -786,7 +924,7 @@ function fromLingxingPrice(row, official, matchStatus, index, ownerIndex) {
 }
 
 function fromOfficialPrice(official, index, ownerIndex) {
-  const ownerMatch = ownerMatchForSkuValues([official.skuCode], ownerIndex, [official.skuName, official.title]);
+  const ownerMatch = ownerMatchForSkuValues([official.skuCode], ownerIndex, [official.skuName, official.title], official);
   return {
     id: `price-official-${official.mallId || 'mall'}-${official.goodsId || normalizeKey(official.title) || index}`,
     sourceSide: 'TEMU官方',
@@ -880,7 +1018,7 @@ function normalizeInventory(rows, ownerIndex) {
       regionGroup: pick(row, ['区域组', 'regionGroup']),
       skuRegionKey: pick(row, ['链接区域键', 'SKU区域键', 'skuRegionKey']),
       skuRegionListingCount: pick(row, ['链接区域行数', '同SKU区域链接数', 'skuRegionListingCount']),
-      skuRegionActiveListingCount: pick(row, ['链接已加入站点SKU数', '同SKU区域在卖链接数', 'skuRegionActiveListingCount']),
+      skuRegionActiveListingCount: pick(row, ['链接上架状态SKU数', '链接已加入站点SKU数', '同SKU区域在卖链接数', 'skuRegionActiveListingCount']),
       skuRegionAvailableQty: pick(row, ['链接同区可用库存', '同SKU区域可用库存', 'skuRegionAvailableQty']),
       skuRegionAlertRepresentative: pick(row, ['提醒代表行', 'skuRegionAlertRepresentative']),
       skuRegionLingxingStatuses: pick(row, ['链接SKU领星状态', '同SKU区域领星状态', 'skuRegionLingxingStatuses']),
@@ -917,7 +1055,8 @@ function normalizeInventory(rows, ownerIndex) {
     const ownerMatch = ownerMatchForSkuValues(
       [out.skuCode, out.listingSkuCodes, out.listingStockedSkuCodes, out.listingSkuInventory, out.listingSkuDetails],
       ownerIndex,
-      [out.skuName, out.title, out.listingSkuDetails]
+      [out.skuName, out.title, out.listingSkuDetails],
+      out
     );
     out.owner = ownerMatch.owner;
     out.ownerStatus = ownerMatch.ownerStatus;
@@ -999,7 +1138,7 @@ function loadInventoryData() {
 
   const ownerIndex = loadSkuOwnerIndex();
   const inventory = {
-    rows: normalizeInventory(readSheet(WAREHOUSE_INVENTORY_CSV), ownerIndex),
+    rows: normalizeInventory(readSheet(WAREHOUSE_INVENTORY_CSV), ownerIndex).filter(row => !isExcludedStoreName(row.storeName)),
     source: fileInfo(WAREHOUSE_INVENTORY_CSV)
   };
   const stores = new Set(inventory.rows.map(row => row.storeRegion).filter(Boolean));

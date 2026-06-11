@@ -10,7 +10,28 @@ function parseJson(value, fallback) {
   return JSON.parse(String(value));
 }
 
-function rowKey(row, index) {
+function text(value) {
+  return String(value || '').trim();
+}
+
+function stableRowKey(row, index) {
+  const candidates = [
+    ['spu', row.platformSpu || row.spuId],
+    ['skc', row.skcId],
+    ['sku-id', row.skuId],
+    ['sku', row.skuCode],
+    ['mall-goods', row.mallId && row.goodsId ? `${row.mallId}|${row.goodsId}` : ''],
+    ['goods', row.goodsId],
+    ['id', row.id]
+  ];
+  for (const [label, value] of candidates) {
+    const normalized = text(value);
+    if (normalized) return `${label}:${normalized}`.slice(0, 255);
+  }
+  return `row-${index}`.slice(0, 255);
+}
+
+function legacyRowKey(row, index) {
   const stableParts = [
     row.platformSpu,
     row.spuId,
@@ -31,6 +52,21 @@ function rowKey(row, index) {
     .filter(Boolean);
   if (stableParts.length) return stableParts.join('|').slice(0, 255);
   return (String(row.id || '').trim() || `row-${index}`).slice(0, 255);
+}
+
+function rowKey(row, index) {
+  return stableRowKey(row, index);
+}
+
+function rowActionLookupKeys(row, index, storedKey) {
+  return [
+    rowKey(row, index),
+    storedKey,
+    legacyRowKey(row, index)
+  ]
+    .map(text)
+    .filter(Boolean)
+    .filter((key, keyIndex, keys) => keys.indexOf(key) === keyIndex);
 }
 
 async function insertRows(connection, snapshotId, mode, rows) {
@@ -146,12 +182,33 @@ async function loadDashboardSnapshot(mode) {
   const parsedRows = dbRows.map((row, index) => {
     const parsed = parseJson(row.row_json, {});
     return {
-      ...parsed,
-      _rowKey: rowKey(parsed, index)
+      row: {
+        ...parsed,
+        _rowKey: rowKey(parsed, index)
+      },
+      lookupKeys: rowActionLookupKeys(parsed, index, row.row_key)
     };
   });
-  const actionMap = await loadRowActions(pool, mode, parsedRows.map(row => row._rowKey));
-  const rows = parsedRows.map(row => withManualActionStatus(mode, row, actionMap.get(row._rowKey)));
+  const actionMap = await loadRowActions(pool, mode, parsedRows.flatMap(row => row.lookupKeys));
+  const stableActions = new Map();
+  const backfills = [];
+  for (const { row, lookupKeys } of parsedRows) {
+    const primaryKey = row._rowKey;
+    const primaryAction = actionMap.get(primaryKey);
+    if (primaryAction) {
+      stableActions.set(primaryKey, primaryAction);
+      continue;
+    }
+    const savedAction = preferCompletedAction(lookupKeys.slice(1).map(key => actionMap.get(key)));
+    if (!savedAction) continue;
+    const existing = stableActions.get(primaryKey);
+    if (!existing || (existing.status !== '已完成' && savedAction.status === '已完成')) {
+      stableActions.set(primaryKey, savedAction);
+    }
+    backfills.push({ rowKey: primaryKey, status: savedAction.status });
+  }
+  if (backfills.length) await backfillStableRowActions(pool, mode, backfills);
+  const rows = parsedRows.map(({ row }) => withManualActionStatus(mode, row, stableActions.get(row._rowKey)));
   const summary = {
     ...parseJson(snapshot.summary_json, {}),
     manual_actionable_rows: rows.filter(row => row.manualActionable === '是').length,
@@ -189,6 +246,36 @@ async function loadRowActions(pool, mode, rowKeys) {
     }
   }
   return actions;
+}
+
+function preferCompletedAction(actions) {
+  const valid = actions.filter(Boolean);
+  return valid.find(action => action.status === '已完成') || valid[0] || null;
+}
+
+async function backfillStableRowActions(pool, mode, actions) {
+  const bestByKey = new Map();
+  for (const action of actions) {
+    const key = text(action?.rowKey);
+    const status = text(action?.status);
+    if (!key || !status) continue;
+    const existing = bestByKey.get(key);
+    if (!existing || (existing.status !== '已完成' && status === '已完成')) {
+      bestByKey.set(key, { rowKey: key, status });
+    }
+  }
+  const rows = [...bestByKey.values()];
+  if (!rows.length) return;
+  for (let start = 0; start < rows.length; start += INSERT_BATCH_SIZE) {
+    const batch = rows.slice(start, start + INSERT_BATCH_SIZE);
+    const values = batch.map(action => [mode, action.rowKey, action.status]);
+    await pool.query(
+      `INSERT INTO dashboard_row_actions (mode, row_key, status)
+       VALUES ?
+       ON DUPLICATE KEY UPDATE row_key = row_key`,
+      [values]
+    );
+  }
 }
 
 function isManualActionable(mode, row) {
@@ -233,7 +320,12 @@ async function setRowActionStatus({ mode, rowKey: key, status }) {
      ON DUPLICATE KEY UPDATE status = VALUES(status), updated_at = CURRENT_TIMESTAMP(3)`,
     [normalizedMode, normalizedKey, normalizedStatus]
   );
-  return { mode: normalizedMode, rowKey: normalizedKey, status: normalizedStatus };
+  return {
+    mode: normalizedMode,
+    rowKey: normalizedKey,
+    status: normalizedStatus,
+    updatedAt: new Date().toISOString()
+  };
 }
 
 async function listSnapshotStatus() {

@@ -4,10 +4,13 @@ const state = {
   rows: [],
   filtered: [],
   filters: new Map(),
+  meta: {},
   health: null
 };
 
 const UPDATE_STALE_MS = 5 * 60 * 60 * 1000;
+const TABLE_RENDER_LIMIT = 500;
+const SEARCH_DEBOUNCE_MS = 160;
 
 const els = {
   title: document.getElementById('pageTitle'),
@@ -215,7 +218,7 @@ const PAGE_CONFIG = {
       ['listingSkuInventory', '链接SKU库存'],
       ['listingSkuDetails', '链接SKU明细'],
       ['skuRegionListingCount', '链接区域行数'],
-      ['skuRegionActiveListingCount', '链接已加入站点SKU数'],
+      ['skuRegionActiveListingCount', '链接上架状态SKU数'],
       ['skuRegionAvailableQty', '链接同区可用库存'],
       ['skuRegionLingxingStatuses', '链接SKU领星状态'],
       ['warehouseRegionMatchStatus', '仓库地区匹配'],
@@ -246,6 +249,7 @@ function compactSearchText(value) {
 }
 
 function searchTextForRow(row) {
+  if (row._searchTextCache) return row._searchTextCache;
   const fields = [
     'platformSpu',
     'spuId',
@@ -280,7 +284,18 @@ function searchTextForRow(row) {
     .filter(Boolean);
   const plain = values.join(' ').toLowerCase();
   const compact = values.map(compactSearchText).filter(Boolean).join(' ');
-  return { plain, compact };
+  const cache = { plain, compact };
+  Object.defineProperty(row, '_searchTextCache', {
+    value: cache,
+    configurable: true,
+    writable: true,
+    enumerable: false
+  });
+  return cache;
+}
+
+function invalidateSearchCache(row) {
+  if (row && row._searchTextCache) delete row._searchTextCache;
 }
 
 function escapeHtml(value) {
@@ -632,11 +647,14 @@ function applyFilters() {
 
 function updateResultCount() {
   if (!els.resultCount) return;
-  els.resultCount.textContent = `${state.filtered.length} / ${state.rows.length}`;
+  const shown = Math.min(state.filtered.length, TABLE_RENDER_LIMIT);
+  els.resultCount.textContent = state.filtered.length > TABLE_RENDER_LIMIT
+    ? `显示 ${shown} / 筛选 ${state.filtered.length} / 全部 ${state.rows.length}`
+    : `${state.filtered.length} / ${state.rows.length}`;
 }
 
 function renderTable() {
-  const rows = state.filtered.slice(0, 2000);
+  const rows = state.filtered.slice(0, TABLE_RENDER_LIMIT);
   if (!rows.length) {
     els.tableBody.innerHTML = `<tr><td colspan="${config.columns.length}" class="empty">没有符合条件的数据</td></tr>`;
     return;
@@ -875,12 +893,35 @@ async function updateManualProcessStatus(button) {
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '处理状态保存失败');
-    await loadData();
+    updateRowsManualStatus(rowKey, nextStatus, payload.data?.updatedAt || new Date().toISOString());
   } catch (error) {
     alert(error.message);
     button.disabled = false;
     button.textContent = currentStatus;
   }
+}
+
+function updateRowsManualStatus(rowKey, status, updatedAt) {
+  let changed = 0;
+  for (const row of state.rows) {
+    if (row._rowKey !== rowKey || row.manualActionable !== '是') continue;
+    row.manualProcessStatus = status;
+    row.manualActionUpdatedAt = updatedAt;
+    invalidateSearchCache(row);
+    changed += 1;
+  }
+  if (!changed) {
+    loadData().catch(error => alert(error.message));
+    return;
+  }
+  recalcManualMetrics();
+  applyFilters();
+}
+
+function recalcManualMetrics() {
+  state.meta.manual_pending_rows = state.rows.filter(row => row.manualProcessStatus === '未处理').length;
+  state.meta.manual_done_rows = state.rows.filter(row => row.manualProcessStatus === '已完成').length;
+  renderMetrics(state.meta);
 }
 
 function handleTableClick(event) {
@@ -897,6 +938,14 @@ function clearFilters() {
   applyFilters();
 }
 
+function debounce(fn, delay) {
+  let timer = null;
+  return (...args) => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => fn(...args), delay);
+  };
+}
+
 async function loadData() {
   els.sourceLine.textContent = '读取数据中';
   els.updateStatus.textContent = '读取数据中';
@@ -904,7 +953,8 @@ async function loadData() {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error?.message || '读取失败');
   state.rows = payload.data || [];
-  renderMetrics(payload.meta || {});
+  state.meta = payload.meta || {};
+  renderMetrics(state.meta);
   renderUpdateStatus(payload);
   els.sourceLine.textContent = config.sourceLine(payload);
   renderFilters();
@@ -962,7 +1012,7 @@ function exportFiltered() {
 
 renderPageChrome();
 loadHealth();
-els.searchInput.addEventListener('input', applyFilters);
+els.searchInput.addEventListener('input', debounce(applyFilters, SEARCH_DEBOUNCE_MS));
 els.filterGrid.addEventListener('click', handleFilterClick);
 els.filterGrid.addEventListener('input', handleFilterInput);
 els.tableBody.addEventListener('click', handleTableClick);
