@@ -205,7 +205,7 @@ async function loadDashboardSnapshot(mode) {
     if (!existing || (existing.status !== '已完成' && savedAction.status === '已完成')) {
       stableActions.set(primaryKey, savedAction);
     }
-    backfills.push({ rowKey: primaryKey, status: savedAction.status });
+    backfills.push({ rowKey: primaryKey, status: savedAction.status, note: savedAction.note || '' });
   }
   if (backfills.length) await backfillStableRowActions(pool, mode, backfills);
   const rows = parsedRows.map(({ row }) => withManualActionStatus(mode, row, stableActions.get(row._rowKey)));
@@ -233,7 +233,7 @@ async function loadRowActions(pool, mode, rowKeys) {
     const batch = keys.slice(start, start + INSERT_BATCH_SIZE);
     const placeholders = batch.map(() => '?').join(',');
     const [rows] = await pool.execute(
-      `SELECT row_key, status, updated_at
+      `SELECT row_key, status, note, updated_at
        FROM dashboard_row_actions
        WHERE mode = ? AND row_key IN (${placeholders})`,
       [mode, ...batch]
@@ -241,6 +241,7 @@ async function loadRowActions(pool, mode, rowKeys) {
     for (const row of rows) {
       actions.set(row.row_key, {
         status: row.status,
+        note: row.note || '',
         updatedAt: row.updated_at
       });
     }
@@ -250,7 +251,11 @@ async function loadRowActions(pool, mode, rowKeys) {
 
 function preferCompletedAction(actions) {
   const valid = actions.filter(Boolean);
-  return valid.find(action => action.status === '已完成') || valid[0] || null;
+  return valid.find(action => action.status === '已完成' && text(action.note)) ||
+    valid.find(action => action.status === '已完成') ||
+    valid.find(action => text(action.note)) ||
+    valid[0] ||
+    null;
 }
 
 async function backfillStableRowActions(pool, mode, actions) {
@@ -268,9 +273,9 @@ async function backfillStableRowActions(pool, mode, actions) {
   if (!rows.length) return;
   for (let start = 0; start < rows.length; start += INSERT_BATCH_SIZE) {
     const batch = rows.slice(start, start + INSERT_BATCH_SIZE);
-    const values = batch.map(action => [mode, action.rowKey, action.status]);
+    const values = batch.map(action => [mode, action.rowKey, action.status, text(action.note)]);
     await pool.query(
-      `INSERT INTO dashboard_row_actions (mode, row_key, status)
+      `INSERT INTO dashboard_row_actions (mode, row_key, status, note)
        VALUES ?
        ON DUPLICATE KEY UPDATE row_key = row_key`,
       [values]
@@ -300,7 +305,8 @@ function withManualActionStatus(mode, row, savedAction) {
     ...row,
     manualActionable: actionable ? '是' : '否',
     manualProcessStatus,
-    manualActionUpdatedAt: savedAction?.updatedAt || ''
+    manualActionUpdatedAt: savedAction?.updatedAt || '',
+    manualRemark: savedAction?.note || ''
   };
 }
 
@@ -328,6 +334,30 @@ async function setRowActionStatus({ mode, rowKey: key, status }) {
   };
 }
 
+async function setRowActionNote({ mode, rowKey: key, note }) {
+  const normalizedMode = String(mode || '').trim();
+  const normalizedKey = String(key || '').trim();
+  const normalizedNote = String(note || '').trim();
+  if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
+  if (!normalizedKey) throw new Error('rowKey 不能为空');
+  if (normalizedNote.length > 300) throw new Error('备注不能超过300字');
+
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  await pool.execute(
+    `INSERT INTO dashboard_row_actions (mode, row_key, status, note)
+     VALUES (?, ?, '未处理', ?)
+     ON DUPLICATE KEY UPDATE note = VALUES(note), updated_at = CURRENT_TIMESTAMP(3)`,
+    [normalizedMode, normalizedKey, normalizedNote]
+  );
+  return {
+    mode: normalizedMode,
+    rowKey: normalizedKey,
+    note: normalizedNote,
+    updatedAt: new Date().toISOString()
+  };
+}
+
 async function listSnapshotStatus() {
   const pool = getPool();
   const [rows] = await pool.execute(
@@ -343,5 +373,6 @@ module.exports = {
   loadDashboardSnapshot,
   rowKey,
   saveDashboardSnapshot,
+  setRowActionNote,
   setRowActionStatus
 };

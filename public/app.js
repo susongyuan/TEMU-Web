@@ -203,6 +203,7 @@ const PAGE_CONFIG = {
       ['stockAction', '处理动作'],
       ['manualProcessStatus', '处理状态'],
       ['manualActionUpdatedAt', '处理时间'],
+      ['manualRemark', '处理备注'],
       ['inventoryAlertReason', '提醒原因'],
       ['skuRegionAlertRepresentative', '提醒代表行'],
       ['hasInventoryButOffShelf', '有库存但无在卖链接'],
@@ -275,7 +276,8 @@ function searchTextForRow(row) {
     'warehouseSku',
     'warehouse',
     'inventoryAlertReason',
-    'manualProcessStatus'
+    'manualProcessStatus',
+    'manualRemark'
   ];
   const explicitValues = fields.map(field => row[field]);
   const values = [...explicitValues, ...Object.values(row)]
@@ -724,8 +726,23 @@ function statusSummaryCell(row, key) {
     .split(/[；;,，\n]+/)
     .map(cleanStatusText)
     .filter(Boolean);
-  if (!values.length) return '';
-  return `<div class="status-list-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`;
+  const note = text(row.manualRemark);
+  const statusHtml = values.length
+    ? `<div class="status-list-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`
+    : '';
+  const noteHtml = row._rowKey ? `
+    <div class="row-note ${note ? 'has-note' : ''}">
+      ${note ? `<span title="${escapeHtml(note)}">备注：${escapeHtml(note)}</span>` : ''}
+      <button
+        type="button"
+        class="row-note-button"
+        data-row-key="${escapeHtml(row._rowKey)}"
+        data-current-note="${escapeHtml(note)}"
+        title="${note ? '编辑备注' : '添加备注'}"
+      >${note ? '编辑' : '备注'}</button>
+    </div>
+  ` : '';
+  return `<div class="status-with-note">${statusHtml}${noteHtml}</div>`;
 }
 
 function pill(textValue, type = '') {
@@ -901,6 +918,36 @@ async function updateManualProcessStatus(button) {
   }
 }
 
+async function updateRowNote(button) {
+  const rowKey = button.dataset.rowKey;
+  const currentNote = button.dataset.currentNote || '';
+  if (!rowKey) return;
+  const nextNoteRaw = window.prompt('填写备注，留空可清除', currentNote);
+  if (nextNoteRaw === null) return;
+  const nextNote = text(nextNoteRaw);
+  if (nextNote.length > 300) {
+    alert('备注不能超过300字');
+    return;
+  }
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '保存中';
+  try {
+    const response = await fetch('/api/action-note', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: PAGE, rowKey, note: nextNote })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '备注保存失败');
+    updateRowsManualRemark(rowKey, payload.data?.note || nextNote, payload.data?.updatedAt || new Date().toISOString());
+  } catch (error) {
+    alert(error.message);
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
 function updateRowsManualStatus(rowKey, status, updatedAt) {
   let changed = 0;
   for (const row of state.rows) {
@@ -918,6 +965,22 @@ function updateRowsManualStatus(rowKey, status, updatedAt) {
   applyFilters();
 }
 
+function updateRowsManualRemark(rowKey, note, updatedAt) {
+  let changed = 0;
+  for (const row of state.rows) {
+    if (row._rowKey !== rowKey) continue;
+    row.manualRemark = note;
+    row.manualActionUpdatedAt = updatedAt;
+    invalidateSearchCache(row);
+    changed += 1;
+  }
+  if (!changed) {
+    loadData().catch(error => alert(error.message));
+    return;
+  }
+  applyFilters();
+}
+
 function recalcManualMetrics() {
   state.meta.manual_pending_rows = state.rows.filter(row => row.manualProcessStatus === '未处理').length;
   state.meta.manual_done_rows = state.rows.filter(row => row.manualProcessStatus === '已完成').length;
@@ -925,6 +988,11 @@ function recalcManualMetrics() {
 }
 
 function handleTableClick(event) {
+  const noteButton = event.target.closest('.row-note-button');
+  if (noteButton) {
+    updateRowNote(noteButton);
+    return;
+  }
   const button = event.target.closest('.manual-status-toggle');
   if (button) {
     updateManualProcessStatus(button);

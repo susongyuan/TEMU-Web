@@ -4,7 +4,7 @@ const { spawn } = require('child_process');
 const express = require('express');
 const compression = require('compression');
 const { ensureEnvLoaded } = require('./env');
-const { loadDashboardSnapshot, listSnapshotStatus, setRowActionStatus } = require('./snapshot-store');
+const { loadDashboardSnapshot, listSnapshotStatus, setRowActionNote, setRowActionStatus } = require('./snapshot-store');
 
 ensureEnvLoaded();
 
@@ -238,6 +238,25 @@ app.post('/api/action-status', async (req, res) => {
     res.status(400).json({
       error: {
         code: 'ACTION_STATUS_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.post('/api/action-note', async (req, res) => {
+  try {
+    const result = await setRowActionNote({
+      mode: req.body?.mode,
+      rowKey: req.body?.rowKey,
+      note: req.body?.note
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'ACTION_NOTE_UPDATE_FAILED',
         message: error.message
       }
     });

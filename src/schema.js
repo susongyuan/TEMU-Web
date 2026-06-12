@@ -54,6 +54,7 @@ async function initDashboardSchema(db) {
       mode VARCHAR(32) NOT NULL,
       row_key VARCHAR(255) NOT NULL,
       status VARCHAR(32) NOT NULL DEFAULT '未处理',
+      note TEXT NULL,
       updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
       created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
       PRIMARY KEY (id),
@@ -61,6 +62,11 @@ async function initDashboardSchema(db) {
       KEY idx_dashboard_row_actions_mode_status (mode, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+  const [noteColumns] = await db.query("SHOW COLUMNS FROM dashboard_row_actions LIKE 'note'");
+  if (!noteColumns.length) {
+    await db.query('ALTER TABLE dashboard_row_actions ADD COLUMN note TEXT NULL AFTER status');
+  }
 }
 
 module.exports = {

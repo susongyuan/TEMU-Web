@@ -935,6 +935,57 @@ td.col-salesAmount {
   line-height: 1.2;
 }
 
+.status-with-note {
+  display: grid;
+  gap: 0.32rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.row-note {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.35rem;
+  align-items: start;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.row-note:not(.has-note) {
+  grid-template-columns: auto;
+  justify-content: start;
+}
+
+.row-note span {
+  min-width: 0;
+  max-height: 3.4rem;
+  overflow: auto;
+  padding: 0.22rem 0.35rem;
+  border: 1px solid #f1d8a8;
+  border-radius: 0.25rem;
+  background: #fffaf1;
+  color: #6f4305;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.row-note-button {
+  min-height: 1.75rem;
+  padding: 0 0.5rem;
+  border-color: #c9d5e4;
+  border-radius: 0.25rem;
+  background: #fff;
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.row-note-button:hover {
+  background: #f4f7fb;
+}
+
 .muted {
   color: var(--muted);
 }
