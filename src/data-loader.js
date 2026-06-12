@@ -678,6 +678,26 @@ function isActiveStatus(status) {
   return value === '在售' || value === '已上架';
 }
 
+function isVoidLingxingStatus(row = {}) {
+  const code = statusCode(row.statusCode || row.lingxingStatusCode || row.status || row.lingxingStatus);
+  const label = statusText(row.status || row.lingxingStatus || row.statusCode || row.lingxingStatusCode);
+  return code === '9' || label === '核价未通过';
+}
+
+function filterLingxingRows(rows) {
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  const afterStoreFilter = sourceRows.filter(row => !isExcludedStoreName(row.storeName));
+  const afterVoidFilter = afterStoreFilter.filter(row => !isVoidLingxingStatus(row));
+  return {
+    rows: afterVoidFilter,
+    stats: {
+      raw_rows: sourceRows.length,
+      excluded_store_rows: sourceRows.length - afterStoreFilter.length,
+      excluded_void_status_rows: afterStoreFilter.length - afterVoidFilter.length
+    }
+  };
+}
+
 function priceForSku(product, skuCode, field) {
   const list = Array.isArray(product[field]) ? product[field] : [];
   if (!list.length) return null;
@@ -716,7 +736,7 @@ function normalizeLingxingRaw(products) {
         skuName: String(item.local_name || product.local_name || item.sku_name || ''),
         status: statusText(rawStatus),
         statusCode: statusCode(rawStatus),
-      storeName: String(item.store_name || product.store_name || ''),
+        storeName: String(item.store_name || product.store_name || ''),
         area: String(item.area || product.area || ''),
         site: String(item.site || product.site || ''),
         title: String(item.platform_product_name || product.platform_product_name || item.title || ''),
@@ -790,16 +810,19 @@ function normalizeOfficial(rows) {
 
 function readLingxing(baseName, standardCsv) {
   const rawFile = findLatestLingxingRaw(baseName);
-  const filterRows = rows => rows.filter(row => !isExcludedStoreName(row.storeName));
   if (rawFile) {
     const products = JSON.parse(fs.readFileSync(rawFile, 'utf8'));
+    const filtered = filterLingxingRows(normalizeLingxingRaw(Array.isArray(products) ? products : []));
     return {
-      rows: filterRows(normalizeLingxingRaw(Array.isArray(products) ? products : [])),
+      rows: filtered.rows,
+      stats: filtered.stats,
       source: fileInfo(rawFile)
     };
   }
+  const filtered = filterLingxingRows(normalizeLingxingSheet(readSheet(standardCsv)));
   return {
-    rows: filterRows(normalizeLingxingSheet(readSheet(standardCsv))),
+    rows: filtered.rows,
+    stats: filtered.stats,
     source: fileInfo(standardCsv)
   };
 }
@@ -1112,6 +1135,9 @@ function loadPriceData() {
     },
     summary: {
       lingxing_rows: lingxing.rows.length,
+      lingxing_raw_rows: lingxing.stats.raw_rows,
+      excluded_store_rows: lingxing.stats.excluded_store_rows,
+      excluded_void_status_rows: lingxing.stats.excluded_void_status_rows,
       temu_official_rows: official.rows.length,
       merged_rows: rows.length,
       matched_rows: rows.filter(row => row.matchStatus === '标题匹配' || row.matchStatus === 'SKU匹配').length,
@@ -1137,8 +1163,11 @@ function loadInventoryData() {
   if (inventoryDataCache?.key === key) return inventoryDataCache.data;
 
   const ownerIndex = loadSkuOwnerIndex();
+  const inventoryRows = normalizeInventory(readSheet(WAREHOUSE_INVENTORY_CSV), ownerIndex);
+  const filteredInventory = filterLingxingRows(inventoryRows);
   const inventory = {
-    rows: normalizeInventory(readSheet(WAREHOUSE_INVENTORY_CSV), ownerIndex).filter(row => !isExcludedStoreName(row.storeName)),
+    rows: filteredInventory.rows,
+    stats: filteredInventory.stats,
     source: fileInfo(WAREHOUSE_INVENTORY_CSV)
   };
   const stores = new Set(inventory.rows.map(row => row.storeRegion).filter(Boolean));
@@ -1153,6 +1182,9 @@ function loadInventoryData() {
     },
     summary: {
       inventory_rows: inventory.rows.length,
+      inventory_raw_rows: inventory.stats.raw_rows,
+      excluded_store_rows: inventory.stats.excluded_store_rows,
+      excluded_void_status_rows: inventory.stats.excluded_void_status_rows,
       inventory_alert_rows: inventory.rows.filter(row => stockCheckType(row) === '强提醒' || stockCheckType(row) === '异常').length,
       has_inventory_but_off_shelf_rows: inventory.rows.filter(row => row.hasInventoryButOffShelf === '是').length,
       action_required_rows: inventory.rows.filter(row => stockCheckType(row) === '需处理').length,

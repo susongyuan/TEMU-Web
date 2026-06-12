@@ -14,6 +14,27 @@ function text(value) {
   return String(value || '').trim();
 }
 
+function isVoidLingxingStatus(row = {}) {
+  const values = [
+    row.statusCode,
+    row.lingxingStatusCode,
+    row.status,
+    row.lingxingStatus,
+    row['领星状态码'],
+    row['领星状态']
+  ].map(text);
+  return values.some(value => value === '9' || value === '核价未通过');
+}
+
+function filterRowsBeforeInsert(rows) {
+  const sourceRows = Array.isArray(rows) ? rows : [];
+  const filteredRows = sourceRows.filter(row => !isVoidLingxingStatus(row));
+  return {
+    rows: filteredRows,
+    excludedVoidStatusRows: sourceRows.length - filteredRows.length
+  };
+}
+
 function stableRowKey(row, index) {
   const candidates = [
     ['spu', row.platformSpu || row.spuId],
@@ -93,15 +114,21 @@ async function saveDashboardSnapshot(data) {
   await initDashboardSchema(pool);
   const connection = await pool.getConnection();
   const mode = String(data.mode);
-  const rows = Array.isArray(data.rows) ? data.rows : [];
+  const rowInput = filterRowsBeforeInsert(data.rows);
+  const rows = rowInput.rows;
   const generatedAt = data.generated_at || new Date().toISOString();
+  const summary = {
+    ...(data.summary || {}),
+    db_import_raw_rows: Array.isArray(data.rows) ? data.rows.length : 0,
+    db_import_excluded_void_status_rows: rowInput.excludedVoidStatusRows
+  };
 
   try {
     await connection.beginTransaction();
 
     const [syncRunResult] = await connection.execute(
       'INSERT INTO sync_runs (source, status, row_count, message, summary_json) VALUES (?, ?, ?, ?, ?)',
-      [`dashboard:${mode}`, 'running', rows.length, 'import started', JSON.stringify(data.summary || {})]
+      [`dashboard:${mode}`, 'running', rows.length, 'import started', JSON.stringify(summary)]
     );
     const syncRunId = syncRunResult.insertId;
 
@@ -112,7 +139,7 @@ async function saveDashboardSnapshot(data) {
       [
         mode,
         generatedAt,
-        JSON.stringify(data.summary || {}),
+        JSON.stringify(summary),
         JSON.stringify(data.sources || {}),
         rows.length
       ]
@@ -126,7 +153,7 @@ async function saveDashboardSnapshot(data) {
       `UPDATE sync_runs
        SET status = ?, finished_at = CURRENT_TIMESTAMP(3), row_count = ?, message = ?, summary_json = ?
        WHERE id = ?`,
-      ['success', rows.length, `snapshot ${snapshotId} imported`, JSON.stringify(data.summary || {}), syncRunId]
+      ['success', rows.length, `snapshot ${snapshotId} imported`, JSON.stringify(summary), syncRunId]
     );
     await connection.execute(
       `DELETE FROM sync_runs
