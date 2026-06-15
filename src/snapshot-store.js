@@ -14,6 +14,12 @@ function text(value) {
   return String(value || '').trim();
 }
 
+function dateText(value) {
+  if (!value) return '';
+  if (value instanceof Date) return value.toISOString();
+  return String(value);
+}
+
 function isVoidLingxingStatus(row = {}) {
   const values = [
     row.statusCode,
@@ -217,6 +223,7 @@ async function loadDashboardSnapshot(mode) {
     };
   });
   const actionMap = await loadRowActions(pool, mode, parsedRows.flatMap(row => row.lookupKeys));
+  const noteMap = await loadRowActionNotes(pool, mode, parsedRows.flatMap(row => row.lookupKeys));
   const stableActions = new Map();
   const backfills = [];
   for (const { row, lookupKeys } of parsedRows) {
@@ -235,7 +242,12 @@ async function loadDashboardSnapshot(mode) {
     backfills.push({ rowKey: primaryKey, status: savedAction.status, note: savedAction.note || '' });
   }
   if (backfills.length) await backfillStableRowActions(pool, mode, backfills);
-  const rows = parsedRows.map(({ row }) => withManualActionStatus(mode, row, stableActions.get(row._rowKey)));
+  const rows = parsedRows.map(({ row, lookupKeys }) => withManualActionStatus(
+    mode,
+    row,
+    stableActions.get(row._rowKey),
+    notesForLookupKeys(lookupKeys, noteMap)
+  ));
   const summary = {
     ...parseJson(snapshot.summary_json, {}),
     manual_actionable_rows: rows.filter(row => row.manualActionable === '是').length,
@@ -274,6 +286,65 @@ async function loadRowActions(pool, mode, rowKeys) {
     }
   }
   return actions;
+}
+
+function noteDto(row) {
+  return {
+    id: String(row.id),
+    rowKey: row.row_key,
+    note: row.note || '',
+    createdAt: dateText(row.created_at),
+    updatedAt: dateText(row.updated_at)
+  };
+}
+
+async function loadRowActionNotes(pool, mode, rowKeys) {
+  const keys = [...new Set(rowKeys.filter(Boolean))];
+  const notes = new Map();
+  if (!keys.length) return notes;
+  for (let start = 0; start < keys.length; start += INSERT_BATCH_SIZE) {
+    const batch = keys.slice(start, start + INSERT_BATCH_SIZE);
+    const placeholders = batch.map(() => '?').join(',');
+    const [rows] = await pool.execute(
+      `SELECT id, row_key, note, created_at, updated_at
+       FROM dashboard_row_action_notes
+       WHERE mode = ? AND row_key IN (${placeholders}) AND deleted_at IS NULL
+       ORDER BY created_at DESC, id DESC`,
+      [mode, ...batch]
+    );
+    for (const row of rows) {
+      const key = row.row_key;
+      if (!notes.has(key)) notes.set(key, []);
+      notes.get(key).push(noteDto(row));
+    }
+  }
+  return notes;
+}
+
+function noteTimeMs(note) {
+  const value = new Date(note.updatedAt || note.createdAt).getTime();
+  return Number.isFinite(value) ? value : 0;
+}
+
+function sortNotes(notes) {
+  return [...notes].sort((a, b) => noteTimeMs(b) - noteTimeMs(a) || Number(b.id) - Number(a.id));
+}
+
+function notesForLookupKeys(lookupKeys, noteMap) {
+  const seen = new Set();
+  const notes = [];
+  for (const key of lookupKeys) {
+    for (const note of noteMap.get(key) || []) {
+      if (seen.has(note.id)) continue;
+      seen.add(note.id);
+      notes.push(note);
+    }
+  }
+  return sortNotes(notes);
+}
+
+function noteLine(note) {
+  return [dateText(note.createdAt || note.updatedAt), text(note.note)].filter(Boolean).join(' ');
 }
 
 function preferCompletedAction(actions) {
@@ -322,18 +393,22 @@ function isManualActionable(mode, row) {
   return false;
 }
 
-function withManualActionStatus(mode, row, savedAction) {
+function withManualActionStatus(mode, row, savedAction, notes = []) {
   const actionable = isManualActionable(mode, row);
   const savedStatus = String(savedAction?.status || '').trim();
   const manualProcessStatus = actionable
     ? (savedStatus === '已完成' ? '已完成' : '未处理')
     : '无需处理';
+  const sortedNotes = sortNotes(notes);
+  const latestNote = sortedNotes[0];
   return {
     ...row,
     manualActionable: actionable ? '是' : '否',
     manualProcessStatus,
-    manualActionUpdatedAt: savedAction?.updatedAt || '',
-    manualRemark: savedAction?.note || ''
+    manualActionUpdatedAt: latestNote?.updatedAt || savedAction?.updatedAt || '',
+    manualRemark: sortedNotes.map(noteLine).join('\n'),
+    manualNoteCount: sortedNotes.length,
+    manualNotes: sortedNotes
   };
 }
 
@@ -368,19 +443,94 @@ async function setRowActionNote({ mode, rowKey: key, note }) {
   if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
   if (!normalizedKey) throw new Error('rowKey 不能为空');
   if (normalizedNote.length > 300) throw new Error('备注不能超过300字');
+  if (!normalizedNote) throw new Error('备注不能为空');
 
   const pool = getPool();
   await initDashboardSchema(pool);
-  await pool.execute(
-    `INSERT INTO dashboard_row_actions (mode, row_key, status, note)
-     VALUES (?, ?, '未处理', ?)
-     ON DUPLICATE KEY UPDATE note = VALUES(note), updated_at = CURRENT_TIMESTAMP(3)`,
-    [normalizedMode, normalizedKey, normalizedNote]
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.execute(
+      `INSERT INTO dashboard_row_actions (mode, row_key, status)
+       VALUES (?, ?, '未处理')
+       ON DUPLICATE KEY UPDATE row_key = row_key`,
+      [normalizedMode, normalizedKey]
+    );
+    const [result] = await connection.execute(
+      `INSERT INTO dashboard_row_action_notes (mode, row_key, note)
+       VALUES (?, ?, ?)`,
+      [normalizedMode, normalizedKey, normalizedNote]
+    );
+    const [rows] = await connection.execute(
+      `SELECT id, row_key, note, created_at, updated_at
+       FROM dashboard_row_action_notes
+       WHERE id = ?`,
+      [result.insertId]
+    );
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      note: noteDto(rows[0]),
+      updatedAt: dateText(rows[0]?.updated_at)
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function updateRowActionNote({ mode, noteId, note }) {
+  const normalizedMode = String(mode || '').trim();
+  const normalizedNoteId = String(noteId || '').trim();
+  const normalizedNote = String(note || '').trim();
+  if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
+  if (!/^\d+$/.test(normalizedNoteId)) throw new Error('备注ID无效');
+  if (!normalizedNote) throw new Error('备注不能为空');
+  if (normalizedNote.length > 300) throw new Error('备注不能超过300字');
+
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const [result] = await pool.execute(
+    `UPDATE dashboard_row_action_notes
+     SET note = ?, updated_at = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
+    [normalizedNote, normalizedNoteId, normalizedMode]
+  );
+  if (!result.affectedRows) throw new Error('备注不存在或已删除');
+  const [rows] = await pool.execute(
+    `SELECT id, row_key, note, created_at, updated_at
+     FROM dashboard_row_action_notes
+     WHERE id = ? AND mode = ?`,
+    [normalizedNoteId, normalizedMode]
   );
   return {
     mode: normalizedMode,
-    rowKey: normalizedKey,
-    note: normalizedNote,
+    note: noteDto(rows[0]),
+    updatedAt: dateText(rows[0]?.updated_at)
+  };
+}
+
+async function deleteRowActionNote({ mode, noteId }) {
+  const normalizedMode = String(mode || '').trim();
+  const normalizedNoteId = String(noteId || '').trim();
+  if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
+  if (!/^\d+$/.test(normalizedNoteId)) throw new Error('备注ID无效');
+
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const [result] = await pool.execute(
+    `UPDATE dashboard_row_action_notes
+     SET deleted_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3)
+     WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
+    [normalizedNoteId, normalizedMode]
+  );
+  if (!result.affectedRows) throw new Error('备注不存在或已删除');
+  return {
+    mode: normalizedMode,
+    noteId: normalizedNoteId,
     updatedAt: new Date().toISOString()
   };
 }
@@ -396,10 +546,12 @@ async function listSnapshotStatus() {
 }
 
 module.exports = {
+  deleteRowActionNote,
   listSnapshotStatus,
   loadDashboardSnapshot,
   rowKey,
   saveDashboardSnapshot,
   setRowActionNote,
-  setRowActionStatus
+  setRowActionStatus,
+  updateRowActionNote
 };

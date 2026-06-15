@@ -4,7 +4,14 @@ const { spawn } = require('child_process');
 const express = require('express');
 const compression = require('compression');
 const { ensureEnvLoaded } = require('./env');
-const { loadDashboardSnapshot, listSnapshotStatus, setRowActionNote, setRowActionStatus } = require('./snapshot-store');
+const {
+  deleteRowActionNote,
+  loadDashboardSnapshot,
+  listSnapshotStatus,
+  setRowActionNote,
+  setRowActionStatus,
+  updateRowActionNote
+} = require('./snapshot-store');
 
 ensureEnvLoaded();
 
@@ -257,6 +264,43 @@ app.post('/api/action-note', async (req, res) => {
     res.status(400).json({
       error: {
         code: 'ACTION_NOTE_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.patch('/api/action-note', async (req, res) => {
+  try {
+    const result = await updateRowActionNote({
+      mode: req.body?.mode,
+      noteId: req.body?.noteId,
+      note: req.body?.note
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'ACTION_NOTE_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.delete('/api/action-note', async (req, res) => {
+  try {
+    const result = await deleteRowActionNote({
+      mode: req.body?.mode,
+      noteId: req.body?.noteId
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'ACTION_NOTE_DELETE_FAILED',
         message: error.message
       }
     });

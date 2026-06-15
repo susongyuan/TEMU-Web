@@ -4,6 +4,7 @@ const state = {
   rows: [],
   filtered: [],
   filters: new Map(),
+  notePanel: { rowKey: '', editingId: '' },
   meta: {},
   health: null
 };
@@ -713,6 +714,40 @@ function priceDetailsCell(row, key) {
   return `<div class="price-details-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`;
 }
 
+function sortManualNotes(notes) {
+  return [...notes].sort((a, b) => {
+    const left = new Date(a.updatedAt || a.createdAt).getTime();
+    const right = new Date(b.updatedAt || b.createdAt).getTime();
+    const leftTime = Number.isFinite(left) ? left : 0;
+    const rightTime = Number.isFinite(right) ? right : 0;
+    return rightTime - leftTime || Number(b.id || 0) - Number(a.id || 0);
+  });
+}
+
+function manualNotesForRow(row) {
+  if (Array.isArray(row.manualNotes)) return sortManualNotes(row.manualNotes);
+  const note = text(row.manualRemark);
+  if (!note) return [];
+  return [{
+    id: '',
+    note,
+    createdAt: row.manualActionUpdatedAt || '',
+    updatedAt: row.manualActionUpdatedAt || ''
+  }];
+}
+
+function noteTimestamp(note) {
+  return formatDateTime(note.updatedAt || note.createdAt).replace('未生成', '');
+}
+
+function noteLine(note) {
+  return [noteTimestamp(note), text(note.note)].filter(Boolean).join(' ');
+}
+
+function manualRemarkForNotes(notes) {
+  return sortManualNotes(notes).map(noteLine).join('\n');
+}
+
 function cleanStatusText(value) {
   return text(value)
     .replace(/\((\d+)\)/g, '')
@@ -726,20 +761,29 @@ function statusSummaryCell(row, key) {
     .split(/[；;,，\n]+/)
     .map(cleanStatusText)
     .filter(Boolean);
-  const note = text(row.manualRemark);
+  const notes = manualNotesForRow(row);
+  const latestNotes = notes.slice(0, 2);
   const statusHtml = values.length
     ? `<div class="status-list-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`
     : '';
   const noteHtml = row._rowKey ? `
-    <div class="row-note ${note ? 'has-note' : ''}">
-      ${note ? `<span title="${escapeHtml(note)}">备注：${escapeHtml(note)}</span>` : ''}
+    <div class="row-note ${notes.length ? 'has-note' : ''}">
+      ${latestNotes.length ? `
+        <div class="row-note-list">
+          ${latestNotes.map(note => `
+            <div class="row-note-item" title="${escapeHtml(noteLine(note))}">
+              <span class="row-note-time">${escapeHtml(noteTimestamp(note))}</span>
+              <span class="row-note-text">${escapeHtml(note.note)}</span>
+            </div>
+          `).join('')}
+        </div>
+      ` : ''}
       <button
         type="button"
         class="row-note-button"
         data-row-key="${escapeHtml(row._rowKey)}"
-        data-current-note="${escapeHtml(note)}"
-        title="${note ? '编辑备注' : '添加备注'}"
-      >${note ? '编辑' : '备注'}</button>
+        title="${notes.length ? '管理备注' : '添加备注'}"
+      >${notes.length ? `备注 ${notes.length}` : '备注'}</button>
     </div>
   ` : '';
   return `<div class="status-with-note">${statusHtml}${noteHtml}</div>`;
@@ -918,36 +962,6 @@ async function updateManualProcessStatus(button) {
   }
 }
 
-async function updateRowNote(button) {
-  const rowKey = button.dataset.rowKey;
-  const currentNote = button.dataset.currentNote || '';
-  if (!rowKey) return;
-  const nextNoteRaw = window.prompt('填写备注，留空可清除', currentNote);
-  if (nextNoteRaw === null) return;
-  const nextNote = text(nextNoteRaw);
-  if (nextNote.length > 300) {
-    alert('备注不能超过300字');
-    return;
-  }
-  const originalText = button.textContent;
-  button.disabled = true;
-  button.textContent = '保存中';
-  try {
-    const response = await fetch('/api/action-note', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: PAGE, rowKey, note: nextNote })
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error?.message || '备注保存失败');
-    updateRowsManualRemark(rowKey, payload.data?.note || nextNote, payload.data?.updatedAt || new Date().toISOString());
-  } catch (error) {
-    alert(error.message);
-    button.disabled = false;
-    button.textContent = originalText;
-  }
-}
-
 function updateRowsManualStatus(rowKey, status, updatedAt) {
   let changed = 0;
   for (const row of state.rows) {
@@ -965,13 +979,20 @@ function updateRowsManualStatus(rowKey, status, updatedAt) {
   applyFilters();
 }
 
-function updateRowsManualRemark(rowKey, note, updatedAt) {
+function setRowNotes(row, notes, updatedAt = '') {
+  row.manualNotes = sortManualNotes(notes);
+  row.manualNoteCount = row.manualNotes.length;
+  row.manualRemark = manualRemarkForNotes(row.manualNotes);
+  row.manualActionUpdatedAt = updatedAt || row.manualNotes[0]?.updatedAt || row.manualNotes[0]?.createdAt || '';
+  invalidateSearchCache(row);
+}
+
+function updateRowsManualNotes(rowKey, mutator, updatedAt = '') {
   let changed = 0;
   for (const row of state.rows) {
     if (row._rowKey !== rowKey) continue;
-    row.manualRemark = note;
-    row.manualActionUpdatedAt = updatedAt;
-    invalidateSearchCache(row);
+    const nextNotes = mutator(manualNotesForRow(row));
+    setRowNotes(row, nextNotes, updatedAt);
     changed += 1;
   }
   if (!changed) {
@@ -979,6 +1000,214 @@ function updateRowsManualRemark(rowKey, note, updatedAt) {
     return;
   }
   applyFilters();
+}
+
+function rowByKey(rowKey) {
+  return state.rows.find(row => row._rowKey === rowKey) || null;
+}
+
+function ensureNotePanel() {
+  let panel = document.getElementById('notePanel');
+  if (panel) return panel;
+  panel = document.createElement('div');
+  panel.id = 'notePanel';
+  panel.className = 'note-panel-backdrop';
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="note-panel" role="dialog" aria-modal="true" aria-labelledby="notePanelTitle">
+      <div class="note-panel-header">
+        <div>
+          <h2 id="notePanelTitle">处理备注</h2>
+          <p id="notePanelMeta"></p>
+        </div>
+        <button type="button" class="note-panel-close" data-note-action="close">关闭</button>
+      </div>
+      <form id="noteForm" class="note-form">
+        <textarea id="noteInput" maxlength="300" rows="4" placeholder="输入本次处理情况"></textarea>
+        <div class="note-form-actions">
+          <span id="noteCounter">0 / 300</span>
+          <button type="button" class="secondary" data-note-action="cancel-edit" hidden>取消编辑</button>
+          <button type="submit" id="noteSubmit">新增备注</button>
+        </div>
+      </form>
+      <div id="noteList" class="note-history"></div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+  panel.addEventListener('click', handleNotePanelClick);
+  panel.querySelector('#noteForm').addEventListener('submit', submitNoteForm);
+  panel.querySelector('#noteInput').addEventListener('input', updateNoteCounter);
+  return panel;
+}
+
+function notePanelElements() {
+  const panel = ensureNotePanel();
+  return {
+    panel,
+    meta: panel.querySelector('#notePanelMeta'),
+    form: panel.querySelector('#noteForm'),
+    input: panel.querySelector('#noteInput'),
+    counter: panel.querySelector('#noteCounter'),
+    submit: panel.querySelector('#noteSubmit'),
+    cancelEdit: panel.querySelector('[data-note-action="cancel-edit"]'),
+    list: panel.querySelector('#noteList')
+  };
+}
+
+function noteRowMeta(row) {
+  return [row.platformSpu ? `SPU ${row.platformSpu}` : '', row.storeRegion, row.stockAction].filter(Boolean).join(' / ');
+}
+
+function openNotePanel(rowKey) {
+  const row = rowByKey(rowKey);
+  if (!row) return;
+  const els = notePanelElements();
+  state.notePanel = { rowKey, editingId: '' };
+  els.meta.textContent = noteRowMeta(row);
+  els.input.value = '';
+  els.submit.textContent = '新增备注';
+  els.cancelEdit.hidden = true;
+  renderNoteHistory(row);
+  updateNoteCounter();
+  els.panel.hidden = false;
+  els.input.focus();
+}
+
+function closeNotePanel() {
+  const els = notePanelElements();
+  els.panel.hidden = true;
+  state.notePanel = { rowKey: '', editingId: '' };
+}
+
+function renderNoteHistory(row) {
+  const { list } = notePanelElements();
+  const notes = manualNotesForRow(row);
+  if (!notes.length) {
+    list.innerHTML = '<div class="note-empty">暂无备注</div>';
+    return;
+  }
+  list.innerHTML = notes.map(note => `
+    <article class="note-history-item" data-note-id="${escapeHtml(note.id)}">
+      <time>${escapeHtml(noteTimestamp(note))}</time>
+      <p>${escapeHtml(note.note)}</p>
+      <div class="note-history-actions">
+        <button type="button" class="secondary" data-note-action="edit" data-note-id="${escapeHtml(note.id)}">编辑</button>
+        <button type="button" class="secondary danger-action" data-note-action="delete" data-note-id="${escapeHtml(note.id)}">删除</button>
+      </div>
+    </article>
+  `).join('');
+}
+
+function updateNotePanelRow() {
+  const row = rowByKey(state.notePanel.rowKey);
+  if (!row) {
+    closeNotePanel();
+    return;
+  }
+  renderNoteHistory(row);
+}
+
+function updateNoteCounter() {
+  const { input, counter } = notePanelElements();
+  counter.textContent = `${input.value.length} / 300`;
+}
+
+function beginEditNote(noteId) {
+  const row = rowByKey(state.notePanel.rowKey);
+  const note = manualNotesForRow(row).find(item => String(item.id) === String(noteId));
+  if (!note) return;
+  const els = notePanelElements();
+  state.notePanel.editingId = String(note.id);
+  els.input.value = note.note;
+  els.submit.textContent = '保存修改';
+  els.cancelEdit.hidden = false;
+  updateNoteCounter();
+  els.input.focus();
+}
+
+function cancelEditNote() {
+  const els = notePanelElements();
+  state.notePanel.editingId = '';
+  els.input.value = '';
+  els.submit.textContent = '新增备注';
+  els.cancelEdit.hidden = true;
+  updateNoteCounter();
+}
+
+async function submitNoteForm(event) {
+  event.preventDefault();
+  const els = notePanelElements();
+  const rowKey = state.notePanel.rowKey;
+  const note = text(els.input.value);
+  if (!rowKey) return;
+  if (!note) {
+    alert('备注不能为空');
+    return;
+  }
+  if (note.length > 300) {
+    alert('备注不能超过300字');
+    return;
+  }
+
+  const editingId = state.notePanel.editingId;
+  els.submit.disabled = true;
+  els.submit.textContent = '保存中';
+  try {
+    const response = await fetch('/api/action-note', {
+      method: editingId ? 'PATCH' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(editingId ? { mode: PAGE, noteId: editingId, note } : { mode: PAGE, rowKey, note })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '备注保存失败');
+    const savedNote = payload.data?.note;
+    if (!savedNote) throw new Error('备注保存失败');
+    updateRowsManualNotes(rowKey, notes => {
+      if (editingId) {
+        return notes.map(item => String(item.id) === String(savedNote.id) ? savedNote : item);
+      }
+      return [savedNote, ...notes];
+    }, savedNote.updatedAt || new Date().toISOString());
+    cancelEditNote();
+    updateNotePanelRow();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    els.submit.disabled = false;
+    els.submit.textContent = state.notePanel.editingId ? '保存修改' : '新增备注';
+  }
+}
+
+async function deleteNote(noteId) {
+  if (!window.confirm('删除这条备注？')) return;
+  const rowKey = state.notePanel.rowKey;
+  try {
+    const response = await fetch('/api/action-note', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: PAGE, noteId })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '备注删除失败');
+    updateRowsManualNotes(rowKey, notes => notes.filter(note => String(note.id) !== String(noteId)), payload.data?.updatedAt || new Date().toISOString());
+    if (String(state.notePanel.editingId) === String(noteId)) cancelEditNote();
+    updateNotePanelRow();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function handleNotePanelClick(event) {
+  const action = event.target.closest('[data-note-action]');
+  if (!action) {
+    if (event.target.id === 'notePanel') closeNotePanel();
+    return;
+  }
+  const type = action.dataset.noteAction;
+  if (type === 'close') closeNotePanel();
+  if (type === 'cancel-edit') cancelEditNote();
+  if (type === 'edit') beginEditNote(action.dataset.noteId);
+  if (type === 'delete') deleteNote(action.dataset.noteId);
 }
 
 function recalcManualMetrics() {
@@ -990,7 +1219,7 @@ function recalcManualMetrics() {
 function handleTableClick(event) {
   const noteButton = event.target.closest('.row-note-button');
   if (noteButton) {
-    updateRowNote(noteButton);
+    openNotePanel(noteButton.dataset.rowKey);
     return;
   }
   const button = event.target.closest('.manual-status-toggle');
@@ -1088,7 +1317,10 @@ document.addEventListener('click', event => {
   if (!event.target.closest('.filter-menu')) closeFilterMenus();
 });
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape') closeFilterMenus();
+  if (event.key === 'Escape') {
+    closeFilterMenus();
+    closeNotePanel();
+  }
 });
 
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));

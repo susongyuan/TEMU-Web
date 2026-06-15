@@ -956,16 +956,38 @@ td.col-salesAmount {
   justify-content: start;
 }
 
-.row-note span {
+.row-note-list {
+  display: grid;
+  gap: 0.22rem;
   min-width: 0;
-  max-height: 3.4rem;
+  max-height: 5.2rem;
   overflow: auto;
+}
+
+.row-note-item {
+  display: grid;
+  grid-template-columns: minmax(5.6rem, auto) minmax(0, 1fr);
+  gap: 0.35rem;
+  min-width: 0;
   padding: 0.22rem 0.35rem;
   border: 1px solid #f1d8a8;
   border-radius: 0.25rem;
   background: #fffaf1;
   color: #6f4305;
   line-height: 1.35;
+}
+
+.row-note-time {
+  color: #8a5b10;
+  font-size: 0.72rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.row-note-text {
+  min-width: 0;
+  max-height: 2.9rem;
+  overflow: auto;
   overflow-wrap: anywhere;
   word-break: break-word;
 }
@@ -984,6 +1006,197 @@ td.col-salesAmount {
 
 .row-note-button:hover {
   background: #f4f7fb;
+}
+
+.note-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(23, 32, 47, 0.36);
+}
+
+.note-panel-backdrop[hidden] {
+  display: none;
+}
+
+.note-panel {
+  width: min(46rem, 100%);
+  max-height: min(42rem, calc(100vh - 2rem));
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 0.75rem;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.5rem;
+  background: #fff;
+  box-shadow: var(--shadow);
+}
+
+.note-panel-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1rem 0;
+}
+
+.note-panel h2 {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.note-panel p {
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.note-panel-close {
+  min-height: 2rem;
+  padding: 0 0.65rem;
+  border-color: var(--line-strong);
+  background: #fff;
+  color: var(--text);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.note-panel-close:hover {
+  background: #f4f7fb;
+}
+
+.note-form {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0 1rem;
+}
+
+.note-form textarea {
+  width: 100%;
+  min-height: 6rem;
+  resize: vertical;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.375rem;
+  color: var(--text);
+  font: inherit;
+  line-height: 1.45;
+}
+
+.note-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.note-form-actions span {
+  margin-right: auto;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.note-form-actions button {
+  min-height: 2.25rem;
+}
+
+.note-history {
+  display: grid;
+  gap: 0.5rem;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 1rem 1rem;
+}
+
+.note-empty {
+  padding: 1rem;
+  border: 1px dashed var(--line-strong);
+  border-radius: 0.375rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+.note-history-item {
+  display: grid;
+  grid-template-columns: minmax(7rem, auto) minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: start;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+  background: #fbfcfe;
+}
+
+.note-history-item time {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.note-history-item p {
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.note-history-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.note-history-actions button {
+  min-height: 2rem;
+  padding: 0 0.55rem;
+  font-size: 0.75rem;
+}
+
+.danger-action {
+  border-color: #efb0aa;
+  color: var(--danger);
+}
+
+.danger-action:hover {
+  background: #fff0ee;
+}
+
+@media (max-width: 767px) {
+  .note-panel {
+    max-height: calc(100vh - 1rem);
+  }
+
+  .note-panel-header,
+  .note-form-actions,
+  .note-history-item,
+  .note-history-actions {
+    align-items: stretch;
+  }
+
+  .note-history-item {
+    grid-template-columns: 1fr;
+  }
+
+  .note-history-actions {
+    justify-content: flex-start;
+  }
+
+  .row-note {
+    grid-template-columns: 1fr;
+  }
+
+  .row-note-button {
+    width: fit-content;
+  }
 }
 
 .muted {
