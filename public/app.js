@@ -40,7 +40,7 @@ const PAGE_CONFIG = {
     sourceLine(payload) {
       const meta = payload.meta || {};
       return `领星：${sourceText(payload.sources?.lingxing_price)}；TEMU官方：${sourceText(payload.sources?.temu_official)}；` +
-        `合并行：${meta.merged_rows || 0}；超价20%：${meta.price_alert_rows || 0}；页面刷新：${new Date(payload.generated_at).toLocaleString('zh-CN')}`;
+        `合并行：${meta.merged_rows || 0}；超价20%：${meta.price_alert_rows || 0}；页面刷新：${formatDateTime(payload.generated_at)}`;
     },
     metrics: [
       ['lingxing_rows', '领星行数'],
@@ -126,7 +126,7 @@ const PAGE_CONFIG = {
     sourceLine(payload) {
       const meta = payload.meta || {};
       return `库存文件：${sourceText(payload.sources?.warehouse_inventory)}；领星全状态：${sourceText(payload.sources?.lingxing_inventory)}；` +
-        `库存核对行：${meta.inventory_rows || 0}；强提醒：${meta.inventory_alert_rows || 0}；需处理：${meta.action_required_rows || 0}；页面刷新：${new Date(payload.generated_at).toLocaleString('zh-CN')}`;
+        `库存核对行：${meta.inventory_rows || 0}；强提醒：${meta.inventory_alert_rows || 0}；需处理：${meta.action_required_rows || 0}；页面刷新：${formatDateTime(payload.generated_at)}`;
     },
     metrics: [
       ['inventory_rows', '库存核对行'],
@@ -312,7 +312,7 @@ function escapeHtml(value) {
 
 function sourceText(source) {
   if (!source || !source.exists) return '未生成';
-  return `${source.file.split(/[\\/]/).pop()}，${new Date(source.updated_at).toLocaleString('zh-CN')}`;
+  return `${source.file.split(/[\\/]/).pop()}，${formatDateTime(source.updated_at)}`;
 }
 
 function sourceFileName(source) {
@@ -322,9 +322,12 @@ function sourceFileName(source) {
 
 function formatDateTime(value) {
   if (!value) return '未生成';
+  const textValue = String(value).trim();
+  const dbTime = textValue.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?$/);
+  if (dbTime) return `${Number(dbTime[1])}/${Number(dbTime[2])}/${Number(dbTime[3])} ${dbTime[4]}`;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '时间异常';
-  return date.toLocaleString('zh-CN');
+  return date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 }
 
 function ageText(value) {
@@ -716,8 +719,8 @@ function priceDetailsCell(row, key) {
 
 function sortManualNotes(notes) {
   return [...notes].sort((a, b) => {
-    const left = new Date(a.updatedAt || a.createdAt).getTime();
-    const right = new Date(b.updatedAt || b.createdAt).getTime();
+    const left = new Date(a.createdAt || a.updatedAt).getTime();
+    const right = new Date(b.createdAt || b.updatedAt).getTime();
     const leftTime = Number.isFinite(left) ? left : 0;
     const rightTime = Number.isFinite(right) ? right : 0;
     return rightTime - leftTime || Number(b.id || 0) - Number(a.id || 0);
@@ -737,7 +740,7 @@ function manualNotesForRow(row) {
 }
 
 function noteTimestamp(note) {
-  return formatDateTime(note.updatedAt || note.createdAt).replace('未生成', '');
+  return formatDateTime(note.createdAt || note.updatedAt).replace('未生成', '');
 }
 
 function noteLine(note) {

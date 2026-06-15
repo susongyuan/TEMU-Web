@@ -2,6 +2,7 @@ const { getPool } = require('./db');
 const { initDashboardSchema } = require('./schema');
 
 const INSERT_BATCH_SIZE = 500;
+const MYSQL_DATETIME_FORMAT = '%Y-%m-%d %H:%i:%s';
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -272,7 +273,7 @@ async function loadRowActions(pool, mode, rowKeys) {
     const batch = keys.slice(start, start + INSERT_BATCH_SIZE);
     const placeholders = batch.map(() => '?').join(',');
     const [rows] = await pool.execute(
-      `SELECT row_key, status, note, updated_at
+      `SELECT row_key, status, note, DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
        FROM dashboard_row_actions
        WHERE mode = ? AND row_key IN (${placeholders})`,
       [mode, ...batch]
@@ -306,7 +307,9 @@ async function loadRowActionNotes(pool, mode, rowKeys) {
     const batch = keys.slice(start, start + INSERT_BATCH_SIZE);
     const placeholders = batch.map(() => '?').join(',');
     const [rows] = await pool.execute(
-      `SELECT id, row_key, note, created_at, updated_at
+      `SELECT id, row_key, note,
+        DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+        DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
        FROM dashboard_row_action_notes
        WHERE mode = ? AND row_key IN (${placeholders}) AND deleted_at IS NULL
        ORDER BY created_at DESC, id DESC`,
@@ -322,7 +325,7 @@ async function loadRowActionNotes(pool, mode, rowKeys) {
 }
 
 function noteTimeMs(note) {
-  const value = new Date(note.updatedAt || note.createdAt).getTime();
+  const value = new Date(note.createdAt || note.updatedAt).getTime();
   return Number.isFinite(value) ? value : 0;
 }
 
@@ -405,7 +408,7 @@ function withManualActionStatus(mode, row, savedAction, notes = []) {
     ...row,
     manualActionable: actionable ? '是' : '否',
     manualProcessStatus,
-    manualActionUpdatedAt: latestNote?.updatedAt || savedAction?.updatedAt || '',
+    manualActionUpdatedAt: latestNote?.createdAt || savedAction?.updatedAt || '',
     manualRemark: sortedNotes.map(noteLine).join('\n'),
     manualNoteCount: sortedNotes.length,
     manualNotes: sortedNotes
@@ -462,7 +465,9 @@ async function setRowActionNote({ mode, rowKey: key, note }) {
       [normalizedMode, normalizedKey, normalizedNote]
     );
     const [rows] = await connection.execute(
-      `SELECT id, row_key, note, created_at, updated_at
+      `SELECT id, row_key, note,
+        DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+        DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
        FROM dashboard_row_action_notes
        WHERE id = ?`,
       [result.insertId]
@@ -501,7 +506,9 @@ async function updateRowActionNote({ mode, noteId, note }) {
   );
   if (!result.affectedRows) throw new Error('备注不存在或已删除');
   const [rows] = await pool.execute(
-    `SELECT id, row_key, note, created_at, updated_at
+      `SELECT id, row_key, note,
+        DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+        DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
      FROM dashboard_row_action_notes
      WHERE id = ? AND mode = ?`,
     [normalizedNoteId, normalizedMode]

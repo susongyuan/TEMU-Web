@@ -52,7 +52,7 @@ function getDbConfig() {
     connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
     queueLimit: 0,
     charset: 'utf8mb4',
-    timezone: 'Z',
+    timezone: process.env.DB_TIMEZONE || '+08:00',
     supportBigNumbers: true,
     bigNumberStrings: true
   };
