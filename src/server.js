@@ -7,10 +7,15 @@ const { ensureEnvLoaded } = require('./env');
 const {
   deleteRowActionNote,
   loadDashboardSnapshot,
+  listOperationLogs,
   listSnapshotStatus,
   loginOperator,
   registerOperator,
+  setBulkRowActionNote,
+  setBulkRowActionOwner,
+  setBulkRowActionStatus,
   setRowActionNote,
+  setRowActionOwner,
   setRowActionStatus,
   updateRowActionNote
 } = require('./snapshot-store');
@@ -177,6 +182,26 @@ app.get('/api/sources', async (req, res) => {
   }
 });
 
+app.get('/api/operation-logs', async (req, res) => {
+  try {
+    const logs = await listOperationLogs({
+      limit: req.query.limit,
+      mode: req.query.mode,
+      operatorName: req.query.operatorName,
+      actionType: req.query.actionType,
+      keyword: req.query.keyword
+    });
+    res.json({ data: logs });
+  } catch (error) {
+    res.status(500).json({
+      error: {
+        code: 'OPERATION_LOGS_LOAD_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 function operatorFromBody(body = {}) {
   return {
     authToken: body.authToken || body.token,
@@ -296,6 +321,26 @@ app.post('/api/action-status', async (req, res) => {
   }
 });
 
+app.post('/api/action-owner', async (req, res) => {
+  try {
+    const result = await setRowActionOwner({
+      mode: req.body?.mode,
+      rowKey: req.body?.rowKey,
+      ownerName: req.body?.ownerName,
+      operator: operatorFromBody(req.body)
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'ACTION_OWNER_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 app.post('/api/action-note', async (req, res) => {
   try {
     const result = await setRowActionNote({
@@ -310,6 +355,66 @@ app.post('/api/action-note', async (req, res) => {
     res.status(400).json({
       error: {
         code: 'ACTION_NOTE_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.post('/api/bulk-action-status', async (req, res) => {
+  try {
+    const result = await setBulkRowActionStatus({
+      mode: req.body?.mode,
+      rowKeys: req.body?.rowKeys,
+      status: req.body?.status,
+      operator: operatorFromBody(req.body)
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'BULK_ACTION_STATUS_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.post('/api/bulk-action-owner', async (req, res) => {
+  try {
+    const result = await setBulkRowActionOwner({
+      mode: req.body?.mode,
+      rowKeys: req.body?.rowKeys,
+      ownerName: req.body?.ownerName,
+      operator: operatorFromBody(req.body)
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'BULK_ACTION_OWNER_UPDATE_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.post('/api/bulk-action-note', async (req, res) => {
+  try {
+    const result = await setBulkRowActionNote({
+      mode: req.body?.mode,
+      rowKeys: req.body?.rowKeys,
+      note: req.body?.note,
+      operator: operatorFromBody(req.body)
+    });
+    invalidateDashboardCache(result.mode);
+    res.json({ data: result });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'BULK_ACTION_NOTE_UPDATE_FAILED',
         message: error.message
       }
     });

@@ -17,6 +17,7 @@
         <a id="priceNav" class="nav-link" href="/price">价格同步</a>
         <a id="inventoryNav" class="nav-link" href="/inventory">库存上下架</a>
         <button id="operatorBtn" type="button" class="secondary operator-button">操作人：未设置</button>
+        <button id="operationLogBtn" type="button" class="secondary">操作记录</button>
         <button id="refreshBtn" type="button">刷新数据</button>
         <button id="runFetchBtn" type="button">同步更新领星+库存</button>
         <button id="runInventoryBtn" type="button">仅刷新库存</button>
@@ -34,6 +35,15 @@
           <span id="resultCount" class="result-count">0 / 0</span>
         </div>
         <div id="filterGrid" class="filter-grid"></div>
+      </section>
+
+      <section class="batch-toolbar" aria-label="批量操作">
+        <span id="selectionCount" class="selection-count">已选 0</span>
+        <button id="bulkClaimBtn" type="button" class="secondary">批量认领</button>
+        <button id="bulkNoteBtn" type="button" class="secondary">批量备注</button>
+        <button id="bulkDoneBtn" type="button" class="secondary">批量已完成</button>
+        <button id="bulkAbandonBtn" type="button" class="secondary danger-action">批量弃用</button>
+        <button id="clearSelectionBtn" type="button" class="secondary">清空选择</button>
       </section>
 
       <section class="table-shell">

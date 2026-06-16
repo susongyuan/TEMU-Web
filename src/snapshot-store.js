@@ -13,6 +13,19 @@ const MYSQL_DATETIME_FORMAT = '%Y-%m-%d %H:%i:%s';
 const OPERATOR_NAME_MAX_LENGTH = 32;
 const PASSWORD_MIN_LENGTH = 4;
 const TOKEN_VERSION = 1;
+const OPERATION_LOG_LIMIT_DEFAULT = 200;
+const OPERATION_LOG_LIMIT_MAX = 500;
+const BULK_ACTION_LIMIT = 1000;
+const OPERATION_ACTION_LABELS = {
+  operator_register: '注册账号',
+  operator_login: '登录账号',
+  owner_claim: '认领负责人',
+  status_update: '处理状态变更',
+  note_create: '新增备注',
+  note_update: '编辑备注',
+  note_delete: '删除备注'
+};
+const ROW_ACTION_STATUSES = ['未处理', '已完成', '弃用'];
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -127,6 +140,66 @@ function operatorDto(row, { includeToken = false } = {}) {
   return operator;
 }
 
+function jsonOrNull(value) {
+  if (value === undefined || value === null) return null;
+  return JSON.stringify(value);
+}
+
+function operationLabel(actionType, fallback = '') {
+  return OPERATION_ACTION_LABELS[actionType] || fallback || actionType;
+}
+
+function operationLogDto(row) {
+  return {
+    id: String(row.id),
+    mode: row.mode || '',
+    rowKey: row.row_key || '',
+    actionType: row.action_type || '',
+    actionLabel: row.action_label || operationLabel(row.action_type || ''),
+    operatorKey: row.operator_key || '',
+    operatorName: row.operator_name || '',
+    targetType: row.target_type || '',
+    targetId: row.target_id || '',
+    before: parseJson(row.before_json, null),
+    after: parseJson(row.after_json, null),
+    detail: parseJson(row.detail_json, null),
+    createdAt: dateText(row.created_at)
+  };
+}
+
+async function logOperation(db, entry = {}) {
+  const actionType = text(entry.actionType);
+  if (!actionType) throw new Error('操作日志类型不能为空');
+  const operatorName = text(entry.operator?.operatorName || entry.operatorName || '系统');
+  await db.execute(
+    `INSERT INTO dashboard_operation_logs (
+      mode, row_key, action_type, action_label,
+      operator_key, operator_name, target_type, target_id,
+      before_json, after_json, detail_json
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      text(entry.mode) || null,
+      text(entry.rowKey) || null,
+      actionType,
+      operationLabel(actionType, entry.actionLabel),
+      text(entry.operator?.operatorKey || entry.operatorKey) || null,
+      operatorName,
+      text(entry.targetType) || null,
+      text(entry.targetId).slice(0, 128) || null,
+      jsonOrNull(entry.before),
+      jsonOrNull(entry.after),
+      jsonOrNull(entry.detail)
+    ]
+  );
+}
+
+function normalizeOperationLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return OPERATION_LOG_LIMIT_DEFAULT;
+  return Math.min(OPERATION_LOG_LIMIT_MAX, Math.floor(parsed));
+}
+
 async function registerOperator({ operatorName, name, password }) {
   const normalizedName = validateOperatorName(operatorName || name);
   const normalizedPassword = validatePassword(password);
@@ -165,7 +238,16 @@ async function registerOperator({ operatorName, name, password }) {
      LIMIT 1`,
     [normalizedName]
   );
-  return operatorDto(rows[0], { includeToken: true });
+  const operator = operatorDto(rows[0], { includeToken: true });
+  await logOperation(pool, {
+    actionType: 'operator_register',
+    operator,
+    targetType: 'operator',
+    targetId: operator.operatorKey,
+    after: { operatorName: operator.operatorName },
+    detail: { operatorName: operator.operatorName }
+  });
+  return operator;
 }
 
 async function loginOperator({ operatorName, name, password }) {
@@ -189,7 +271,15 @@ async function loginOperator({ operatorName, name, password }) {
     'UPDATE dashboard_operators SET last_seen_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3) WHERE operator_key = ?',
     [rows[0].operator_key]
   );
-  return operatorDto(rows[0], { includeToken: true });
+  const operator = operatorDto(rows[0], { includeToken: true });
+  await logOperation(pool, {
+    actionType: 'operator_login',
+    operator,
+    targetType: 'operator',
+    targetId: operator.operatorKey,
+    detail: { operatorName: operator.operatorName }
+  });
+  return operator;
 }
 
 async function resolveOperator(pool, operator = {}) {
@@ -446,7 +536,8 @@ async function loadDashboardSnapshot(mode) {
     ...parseJson(snapshot.summary_json, {}),
     manual_actionable_rows: rows.filter(row => row.manualActionable === '是').length,
     manual_pending_rows: rows.filter(row => row.manualProcessStatus === '未处理').length,
-    manual_done_rows: rows.filter(row => row.manualProcessStatus === '已完成').length
+    manual_done_rows: rows.filter(row => row.manualProcessStatus === '已完成').length,
+    manual_abandoned_rows: rows.filter(row => row.manualProcessStatus === '弃用').length
   };
 
   return {
@@ -468,6 +559,9 @@ async function loadRowActions(pool, mode, rowKeys) {
     const [rows] = await pool.execute(
       `SELECT row_key, status, note,
         updated_by_operator_key, updated_by_operator_name,
+        manual_owner_name,
+        claimed_by_operator_key, claimed_by_operator_name,
+        DATE_FORMAT(claimed_at, '${MYSQL_DATETIME_FORMAT}') AS claimed_at,
         DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
        FROM dashboard_row_actions
        WHERE mode = ? AND row_key IN (${placeholders})`,
@@ -479,7 +573,11 @@ async function loadRowActions(pool, mode, rowKeys) {
         note: row.note || '',
         updatedByOperatorKey: row.updated_by_operator_key || '',
         updatedByName: row.updated_by_operator_name || '',
-        updatedAt: row.updated_at
+        updatedAt: row.updated_at,
+        manualOwnerName: row.manual_owner_name || '',
+        claimedByOperatorKey: row.claimed_by_operator_key || '',
+        claimedByName: row.claimed_by_operator_name || '',
+        claimedAt: row.claimed_at || ''
       });
     }
   }
@@ -555,8 +653,11 @@ function noteLine(note) {
 
 function preferCompletedAction(actions) {
   const valid = actions.filter(Boolean);
-  return valid.find(action => action.status === '已完成' && text(action.note)) ||
+  return valid.find(action => action.status === '弃用' && text(action.note)) ||
+    valid.find(action => action.status === '弃用') ||
+    valid.find(action => action.status === '已完成' && text(action.note)) ||
     valid.find(action => action.status === '已完成') ||
+    valid.find(action => text(action.manualOwnerName)) ||
     valid.find(action => text(action.note)) ||
     valid[0] ||
     null;
@@ -567,21 +668,50 @@ async function backfillStableRowActions(pool, mode, actions) {
   for (const action of actions) {
     const key = text(action?.rowKey);
     const status = text(action?.status);
-    if (!key || !status) continue;
+    const manualOwnerName = text(action?.manualOwnerName);
+    if (!key || (!status && !manualOwnerName)) continue;
     const existing = bestByKey.get(key);
-    if (!existing || (existing.status !== '已完成' && status === '已完成')) {
-      bestByKey.set(key, { rowKey: key, status });
+    if (!existing ||
+      (existing.status !== '弃用' && status === '弃用') ||
+      (!['弃用', '已完成'].includes(existing.status) && status === '已完成') ||
+      (!text(existing.manualOwnerName) && manualOwnerName)
+    ) {
+      bestByKey.set(key, {
+        rowKey: key,
+        status: status || '未处理',
+        manualOwnerName,
+        claimedByOperatorKey: text(action?.claimedByOperatorKey),
+        claimedByName: text(action?.claimedByName),
+        claimedAt: text(action?.claimedAt)
+      });
     }
   }
   const rows = [...bestByKey.values()];
   if (!rows.length) return;
   for (let start = 0; start < rows.length; start += INSERT_BATCH_SIZE) {
     const batch = rows.slice(start, start + INSERT_BATCH_SIZE);
-    const values = batch.map(action => [mode, action.rowKey, action.status, text(action.note)]);
+    const values = batch.map(action => [
+      mode,
+      action.rowKey,
+      action.status,
+      text(action.note),
+      action.manualOwnerName || null,
+      action.claimedByOperatorKey || null,
+      action.claimedByName || null,
+      action.claimedAt || null
+    ]);
     await pool.query(
-      `INSERT INTO dashboard_row_actions (mode, row_key, status, note)
+      `INSERT INTO dashboard_row_actions (
+         mode, row_key, status, note,
+         manual_owner_name, claimed_by_operator_key, claimed_by_operator_name, claimed_at
+       )
        VALUES ?
-       ON DUPLICATE KEY UPDATE row_key = row_key`,
+       ON DUPLICATE KEY UPDATE
+         status = IF(status IN ('已完成', '弃用'), status, VALUES(status)),
+         manual_owner_name = COALESCE(manual_owner_name, VALUES(manual_owner_name)),
+         claimed_by_operator_key = COALESCE(claimed_by_operator_key, VALUES(claimed_by_operator_key)),
+         claimed_by_operator_name = COALESCE(claimed_by_operator_name, VALUES(claimed_by_operator_name)),
+         claimed_at = COALESCE(claimed_at, VALUES(claimed_at))`,
       [values]
     );
   }
@@ -602,16 +732,26 @@ function isManualActionable(mode, row) {
 function withManualActionStatus(mode, row, savedAction, notes = []) {
   const actionable = isManualActionable(mode, row);
   const savedStatus = String(savedAction?.status || '').trim();
-  const manualProcessStatus = actionable
-    ? (savedStatus === '已完成' ? '已完成' : '未处理')
-    : '无需处理';
+  const manualProcessStatus = ROW_ACTION_STATUSES.includes(savedStatus) && (actionable || savedStatus !== '未处理')
+    ? savedStatus
+    : actionable ? '未处理' : '无需处理';
   const sortedNotes = sortNotes(notes);
   const latestNote = sortedNotes[0];
+  const manualOwnerName = text(savedAction?.manualOwnerName);
+  const claimedByName = text(savedAction?.claimedByName);
+  const owner = manualOwnerName || row.owner;
   return {
     ...row,
-    manualActionable: actionable ? '是' : '否',
+    owner,
+    ownerStatus: manualOwnerName ? '已匹配负责人' : row.ownerStatus,
+    ownerMatchType: manualOwnerName ? '手动认领' : row.ownerMatchType,
+    ownerMatchText: manualOwnerName ? `手动认领：${manualOwnerName}` : row.ownerMatchText,
+    manualOwnerName,
+    manualOwnerClaimedBy: claimedByName,
+    manualOwnerClaimedAt: savedAction?.claimedAt || '',
+    manualActionable: (actionable || ['已完成', '弃用'].includes(manualProcessStatus)) ? '是' : '否',
     manualProcessStatus,
-    manualActionUpdatedAt: latestNote?.createdAt || savedAction?.updatedAt || '',
+    manualActionUpdatedAt: latestNote?.createdAt || savedAction?.updatedAt || savedAction?.claimedAt || '',
     manualActionOperator: savedAction?.updatedByName || latestNote?.createdByName || '',
     manualRemarkAuthors: sortedNotes.map(note => note.createdByName).filter(Boolean).join('\n'),
     manualRemark: sortedNotes.map(noteLine).join('\n'),
@@ -620,40 +760,408 @@ function withManualActionStatus(mode, row, savedAction, notes = []) {
   };
 }
 
-async function setRowActionStatus({ mode, rowKey: key, status, operator }) {
-  const normalizedMode = String(mode || '').trim();
-  const normalizedKey = String(key || '').trim();
-  const normalizedStatus = String(status || '').trim();
+function normalizeMode(value) {
+  const normalizedMode = String(value || '').trim();
   if (!['price', 'inventory'].includes(normalizedMode)) throw new Error('mode 无效');
+  return normalizedMode;
+}
+
+function normalizeRowKey(value) {
+  const normalizedKey = String(value || '').trim();
   if (!normalizedKey) throw new Error('rowKey 不能为空');
-  if (!['未处理', '已完成'].includes(normalizedStatus)) throw new Error('处理状态无效');
+  return normalizedKey;
+}
+
+function normalizeRowKeys(rowKeys) {
+  const keys = [...new Set((Array.isArray(rowKeys) ? rowKeys : [rowKeys])
+    .map(value => String(value || '').trim())
+    .filter(Boolean))];
+  if (!keys.length) throw new Error('请先勾选需要处理的行');
+  if (keys.length > BULK_ACTION_LIMIT) throw new Error(`一次最多处理${BULK_ACTION_LIMIT}条`);
+  return keys;
+}
+
+function normalizeRowActionStatus(status) {
+  const normalizedStatus = String(status || '').trim();
+  if (!ROW_ACTION_STATUSES.includes(normalizedStatus)) throw new Error('处理状态无效');
+  return normalizedStatus;
+}
+
+async function setRowActionStatus({ mode, rowKey: key, status, operator }) {
+  const normalizedMode = normalizeMode(mode);
+  const normalizedKey = normalizeRowKey(key);
+  const normalizedStatus = normalizeRowActionStatus(status);
 
   const pool = getPool();
   await initDashboardSchema(pool);
   const resolvedOperator = await resolveOperator(pool, operator);
-  await pool.execute(
-    `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
-     VALUES (?, ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       status = VALUES(status),
-       updated_by_operator_key = VALUES(updated_by_operator_key),
-       updated_by_operator_name = VALUES(updated_by_operator_name),
-       updated_at = CURRENT_TIMESTAMP(3)`,
-    [
-      normalizedMode,
-      normalizedKey,
-      normalizedStatus,
-      resolvedOperator.operatorKey,
-      resolvedOperator.operatorName
-    ]
-  );
-  return {
-    mode: normalizedMode,
-    rowKey: normalizedKey,
-    status: normalizedStatus,
-    operator: resolvedOperator,
-    updatedAt: new Date().toISOString()
-  };
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [beforeRows] = await connection.execute(
+      `SELECT status,
+        updated_by_operator_key, updated_by_operator_name,
+        DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+       FROM dashboard_row_actions
+       WHERE mode = ? AND row_key = ?
+       LIMIT 1`,
+      [normalizedMode, normalizedKey]
+    );
+    const before = beforeRows[0] ? {
+      status: beforeRows[0].status,
+      updatedByOperatorKey: beforeRows[0].updated_by_operator_key || '',
+      updatedByOperatorName: beforeRows[0].updated_by_operator_name || '',
+      updatedAt: beforeRows[0].updated_at || ''
+    } : null;
+    await connection.execute(
+      `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         status = VALUES(status),
+         updated_by_operator_key = VALUES(updated_by_operator_key),
+         updated_by_operator_name = VALUES(updated_by_operator_name),
+         updated_at = CURRENT_TIMESTAMP(3)`,
+      [
+        normalizedMode,
+        normalizedKey,
+        normalizedStatus,
+        resolvedOperator.operatorKey,
+        resolvedOperator.operatorName
+      ]
+    );
+    await logOperation(connection, {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      actionType: 'status_update',
+      operator: resolvedOperator,
+      targetType: 'row_status',
+      targetId: normalizedKey,
+      before,
+      after: { status: normalizedStatus },
+      detail: { status: normalizedStatus }
+    });
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      status: normalizedStatus,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function normalizeOwnerName(value, fallback = '') {
+  const ownerName = text(value || fallback);
+  if (!ownerName) throw new Error('负责人不能为空');
+  if (ownerName.length > 64) throw new Error('负责人不能超过64个字');
+  return ownerName;
+}
+
+async function setRowActionOwner({ mode, rowKey: key, ownerName, operator }) {
+  const normalizedMode = normalizeMode(mode);
+  const normalizedKey = normalizeRowKey(key);
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const resolvedOperator = await resolveOperator(pool, operator);
+  const normalizedOwner = normalizeOwnerName(ownerName, resolvedOperator.operatorName);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [beforeRows] = await connection.execute(
+      `SELECT manual_owner_name,
+        claimed_by_operator_key, claimed_by_operator_name,
+        DATE_FORMAT(claimed_at, '${MYSQL_DATETIME_FORMAT}') AS claimed_at
+       FROM dashboard_row_actions
+       WHERE mode = ? AND row_key = ?
+       LIMIT 1`,
+      [normalizedMode, normalizedKey]
+    );
+    const before = beforeRows[0] ? {
+      owner: beforeRows[0].manual_owner_name || '',
+      claimedByOperatorKey: beforeRows[0].claimed_by_operator_key || '',
+      claimedByOperatorName: beforeRows[0].claimed_by_operator_name || '',
+      claimedAt: beforeRows[0].claimed_at || ''
+    } : null;
+    await connection.execute(
+      `INSERT INTO dashboard_row_actions (
+        mode, row_key, status,
+        manual_owner_name, claimed_by_operator_key, claimed_by_operator_name, claimed_at
+       )
+       VALUES (?, ?, '未处理', ?, ?, ?, CURRENT_TIMESTAMP(3))
+       ON DUPLICATE KEY UPDATE
+         manual_owner_name = VALUES(manual_owner_name),
+         claimed_by_operator_key = VALUES(claimed_by_operator_key),
+         claimed_by_operator_name = VALUES(claimed_by_operator_name),
+         claimed_at = CURRENT_TIMESTAMP(3),
+         updated_at = CURRENT_TIMESTAMP(3)`,
+      [
+        normalizedMode,
+        normalizedKey,
+        normalizedOwner,
+        resolvedOperator.operatorKey,
+        resolvedOperator.operatorName
+      ]
+    );
+    await logOperation(connection, {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      actionType: 'owner_claim',
+      operator: resolvedOperator,
+      targetType: 'row_owner',
+      targetId: normalizedKey,
+      before,
+      after: { owner: normalizedOwner },
+      detail: { owner: normalizedOwner }
+    });
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      ownerName: normalizedOwner,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function setBulkRowActionStatus({ mode, rowKeys, status, operator }) {
+  const normalizedMode = normalizeMode(mode);
+  const keys = normalizeRowKeys(rowKeys);
+  const normalizedStatus = normalizeRowActionStatus(status);
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const resolvedOperator = await resolveOperator(pool, operator);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const normalizedKey of keys) {
+      const [beforeRows] = await connection.execute(
+        `SELECT status,
+          updated_by_operator_key, updated_by_operator_name,
+          DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+         FROM dashboard_row_actions
+         WHERE mode = ? AND row_key = ?
+         LIMIT 1`,
+        [normalizedMode, normalizedKey]
+      );
+      const before = beforeRows[0] ? {
+        status: beforeRows[0].status,
+        updatedByOperatorKey: beforeRows[0].updated_by_operator_key || '',
+        updatedByOperatorName: beforeRows[0].updated_by_operator_name || '',
+        updatedAt: beforeRows[0].updated_at || ''
+      } : null;
+      await connection.execute(
+        `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
+         VALUES (?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           status = VALUES(status),
+           updated_by_operator_key = VALUES(updated_by_operator_key),
+           updated_by_operator_name = VALUES(updated_by_operator_name),
+           updated_at = CURRENT_TIMESTAMP(3)`,
+        [
+          normalizedMode,
+          normalizedKey,
+          normalizedStatus,
+          resolvedOperator.operatorKey,
+          resolvedOperator.operatorName
+        ]
+      );
+      await logOperation(connection, {
+        mode: normalizedMode,
+        rowKey: normalizedKey,
+        actionType: 'status_update',
+        operator: resolvedOperator,
+        targetType: 'row_status',
+        targetId: normalizedKey,
+        before,
+        after: { status: normalizedStatus },
+        detail: { status: normalizedStatus, bulk: true, bulkCount: keys.length }
+      });
+    }
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKeys: keys,
+      status: normalizedStatus,
+      count: keys.length,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function setBulkRowActionOwner({ mode, rowKeys, ownerName, operator }) {
+  const normalizedMode = normalizeMode(mode);
+  const keys = normalizeRowKeys(rowKeys);
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const resolvedOperator = await resolveOperator(pool, operator);
+  const normalizedOwner = normalizeOwnerName(ownerName, resolvedOperator.operatorName);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const normalizedKey of keys) {
+      const [beforeRows] = await connection.execute(
+        `SELECT manual_owner_name,
+          claimed_by_operator_key, claimed_by_operator_name,
+          DATE_FORMAT(claimed_at, '${MYSQL_DATETIME_FORMAT}') AS claimed_at
+         FROM dashboard_row_actions
+         WHERE mode = ? AND row_key = ?
+         LIMIT 1`,
+        [normalizedMode, normalizedKey]
+      );
+      const before = beforeRows[0] ? {
+        owner: beforeRows[0].manual_owner_name || '',
+        claimedByOperatorKey: beforeRows[0].claimed_by_operator_key || '',
+        claimedByOperatorName: beforeRows[0].claimed_by_operator_name || '',
+        claimedAt: beforeRows[0].claimed_at || ''
+      } : null;
+      await connection.execute(
+        `INSERT INTO dashboard_row_actions (
+          mode, row_key, status,
+          manual_owner_name, claimed_by_operator_key, claimed_by_operator_name, claimed_at
+         )
+         VALUES (?, ?, '未处理', ?, ?, ?, CURRENT_TIMESTAMP(3))
+         ON DUPLICATE KEY UPDATE
+           manual_owner_name = VALUES(manual_owner_name),
+           claimed_by_operator_key = VALUES(claimed_by_operator_key),
+           claimed_by_operator_name = VALUES(claimed_by_operator_name),
+           claimed_at = CURRENT_TIMESTAMP(3),
+           updated_at = CURRENT_TIMESTAMP(3)`,
+        [
+          normalizedMode,
+          normalizedKey,
+          normalizedOwner,
+          resolvedOperator.operatorKey,
+          resolvedOperator.operatorName
+        ]
+      );
+      await logOperation(connection, {
+        mode: normalizedMode,
+        rowKey: normalizedKey,
+        actionType: 'owner_claim',
+        operator: resolvedOperator,
+        targetType: 'row_owner',
+        targetId: normalizedKey,
+        before,
+        after: { owner: normalizedOwner },
+        detail: { owner: normalizedOwner, bulk: true, bulkCount: keys.length }
+      });
+    }
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKeys: keys,
+      ownerName: normalizedOwner,
+      count: keys.length,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function setBulkRowActionNote({ mode, rowKeys, note, operator }) {
+  const normalizedMode = normalizeMode(mode);
+  const keys = normalizeRowKeys(rowKeys);
+  const normalizedNote = String(note || '').trim();
+  if (normalizedNote.length > 300) throw new Error('备注不能超过300字');
+  if (!normalizedNote) throw new Error('备注不能为空');
+
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const resolvedOperator = await resolveOperator(pool, operator);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const notes = [];
+    for (const normalizedKey of keys) {
+      await connection.execute(
+        `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
+         VALUES (?, ?, '未处理', ?, ?)
+         ON DUPLICATE KEY UPDATE row_key = row_key`,
+        [normalizedMode, normalizedKey, resolvedOperator.operatorKey, resolvedOperator.operatorName]
+      );
+      const [result] = await connection.execute(
+        `INSERT INTO dashboard_row_action_notes (
+          mode, row_key, note,
+          created_by_operator_key, created_by_operator_name,
+          updated_by_operator_key, updated_by_operator_name
+         )
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          normalizedMode,
+          normalizedKey,
+          normalizedNote,
+          resolvedOperator.operatorKey,
+          resolvedOperator.operatorName,
+          resolvedOperator.operatorKey,
+          resolvedOperator.operatorName
+        ]
+      );
+      const [rows] = await connection.execute(
+        `SELECT id, row_key, note,
+          created_by_operator_key, created_by_operator_name,
+          updated_by_operator_key, updated_by_operator_name,
+          DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+          DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+         FROM dashboard_row_action_notes
+         WHERE id = ?`,
+        [result.insertId]
+      );
+      const savedNote = noteDto(rows[0]);
+      notes.push(savedNote);
+      await logOperation(connection, {
+        mode: normalizedMode,
+        rowKey: normalizedKey,
+        actionType: 'note_create',
+        operator: resolvedOperator,
+        targetType: 'note',
+        targetId: savedNote.id,
+        after: { note: savedNote.note },
+        detail: {
+          note: savedNote.note,
+          noteId: savedNote.id,
+          bulk: true,
+          bulkCount: keys.length
+        }
+      });
+    }
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKeys: keys,
+      notes,
+      count: keys.length,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function setRowActionNote({ mode, rowKey: key, note, operator }) {
@@ -704,13 +1212,27 @@ async function setRowActionNote({ mode, rowKey: key, note, operator }) {
        WHERE id = ?`,
       [result.insertId]
     );
+    const savedNote = noteDto(rows[0]);
+    await logOperation(connection, {
+      mode: normalizedMode,
+      rowKey: normalizedKey,
+      actionType: 'note_create',
+      operator: resolvedOperator,
+      targetType: 'note',
+      targetId: savedNote.id,
+      after: { note: savedNote.note },
+      detail: {
+        note: savedNote.note,
+        noteId: savedNote.id
+      }
+    });
     await connection.commit();
     return {
       mode: normalizedMode,
       rowKey: normalizedKey,
-      note: noteDto(rows[0]),
+      note: savedNote,
       operator: resolvedOperator,
-      updatedAt: dateText(rows[0]?.updated_at)
+      updatedAt: savedNote.updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -732,38 +1254,77 @@ async function updateRowActionNote({ mode, noteId, note, operator }) {
   const pool = getPool();
   await initDashboardSchema(pool);
   const resolvedOperator = await resolveOperator(pool, operator);
-  const [result] = await pool.execute(
-    `UPDATE dashboard_row_action_notes
-     SET note = ?,
-       updated_by_operator_key = ?,
-       updated_by_operator_name = ?,
-       updated_at = CURRENT_TIMESTAMP(3)
-     WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
-    [
-      normalizedNote,
-      resolvedOperator.operatorKey,
-      resolvedOperator.operatorName,
-      normalizedNoteId,
-      normalizedMode
-    ]
-  );
-  if (!result.affectedRows) throw new Error('备注不存在或已删除');
-  const [rows] = await pool.execute(
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [beforeRows] = await connection.execute(
       `SELECT id, row_key, note,
         created_by_operator_key, created_by_operator_name,
         updated_by_operator_key, updated_by_operator_name,
         DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
         DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
-     FROM dashboard_row_action_notes
-     WHERE id = ? AND mode = ?`,
-    [normalizedNoteId, normalizedMode]
-  );
-  return {
-    mode: normalizedMode,
-    note: noteDto(rows[0]),
-    operator: resolvedOperator,
-    updatedAt: dateText(rows[0]?.updated_at)
-  };
+       FROM dashboard_row_action_notes
+       WHERE id = ? AND mode = ? AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedNoteId, normalizedMode]
+    );
+    if (!beforeRows.length) throw new Error('备注不存在或已删除');
+    const beforeNote = noteDto(beforeRows[0]);
+    const [result] = await connection.execute(
+      `UPDATE dashboard_row_action_notes
+       SET note = ?,
+         updated_by_operator_key = ?,
+         updated_by_operator_name = ?,
+         updated_at = CURRENT_TIMESTAMP(3)
+       WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
+      [
+        normalizedNote,
+        resolvedOperator.operatorKey,
+        resolvedOperator.operatorName,
+        normalizedNoteId,
+        normalizedMode
+      ]
+    );
+    if (!result.affectedRows) throw new Error('备注不存在或已删除');
+    const [rows] = await connection.execute(
+        `SELECT id, row_key, note,
+          created_by_operator_key, created_by_operator_name,
+          updated_by_operator_key, updated_by_operator_name,
+          DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+          DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+       FROM dashboard_row_action_notes
+       WHERE id = ? AND mode = ?`,
+      [normalizedNoteId, normalizedMode]
+    );
+    const savedNote = noteDto(rows[0]);
+    await logOperation(connection, {
+      mode: normalizedMode,
+      rowKey: savedNote.rowKey,
+      actionType: 'note_update',
+      operator: resolvedOperator,
+      targetType: 'note',
+      targetId: savedNote.id,
+      before: { note: beforeNote.note },
+      after: { note: savedNote.note },
+      detail: {
+        noteId: savedNote.id,
+        beforeNote: beforeNote.note,
+        afterNote: savedNote.note
+      }
+    });
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      note: savedNote,
+      operator: resolvedOperator,
+      updatedAt: savedNote.updatedAt
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function deleteRowActionNote({ mode, noteId, operator }) {
@@ -775,23 +1336,113 @@ async function deleteRowActionNote({ mode, noteId, operator }) {
   const pool = getPool();
   await initDashboardSchema(pool);
   const resolvedOperator = await resolveOperator(pool, operator);
-  const [result] = await pool.execute(
-    `UPDATE dashboard_row_action_notes
-     SET
-       deleted_by_operator_key = ?,
-       deleted_by_operator_name = ?,
-       deleted_at = CURRENT_TIMESTAMP(3),
-       updated_at = CURRENT_TIMESTAMP(3)
-     WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
-    [resolvedOperator.operatorKey, resolvedOperator.operatorName, normalizedNoteId, normalizedMode]
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [beforeRows] = await connection.execute(
+      `SELECT id, row_key, note,
+        created_by_operator_key, created_by_operator_name,
+        updated_by_operator_key, updated_by_operator_name,
+        DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+        DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+       FROM dashboard_row_action_notes
+       WHERE id = ? AND mode = ? AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedNoteId, normalizedMode]
+    );
+    if (!beforeRows.length) throw new Error('备注不存在或已删除');
+    const beforeNote = noteDto(beforeRows[0]);
+    const [result] = await connection.execute(
+      `UPDATE dashboard_row_action_notes
+       SET
+         deleted_by_operator_key = ?,
+         deleted_by_operator_name = ?,
+         deleted_at = CURRENT_TIMESTAMP(3),
+         updated_at = CURRENT_TIMESTAMP(3)
+       WHERE id = ? AND mode = ? AND deleted_at IS NULL`,
+      [resolvedOperator.operatorKey, resolvedOperator.operatorName, normalizedNoteId, normalizedMode]
+    );
+    if (!result.affectedRows) throw new Error('备注不存在或已删除');
+    await logOperation(connection, {
+      mode: normalizedMode,
+      rowKey: beforeNote.rowKey,
+      actionType: 'note_delete',
+      operator: resolvedOperator,
+      targetType: 'note',
+      targetId: normalizedNoteId,
+      before: { note: beforeNote.note },
+      detail: {
+        noteId: normalizedNoteId,
+        note: beforeNote.note
+      }
+    });
+    await connection.commit();
+    return {
+      mode: normalizedMode,
+      rowKey: beforeNote.rowKey,
+      noteId: normalizedNoteId,
+      operator: resolvedOperator,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function listOperationLogs(options = {}) {
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const limit = normalizeOperationLimit(options.limit);
+  const where = [];
+  const params = [];
+  const mode = text(options.mode);
+  const actionType = text(options.actionType);
+  const operatorName = text(options.operatorName);
+  const keyword = text(options.keyword);
+
+  if (mode && ['price', 'inventory'].includes(mode)) {
+    where.push('mode = ?');
+    params.push(mode);
+  }
+  if (actionType) {
+    where.push('action_type = ?');
+    params.push(actionType);
+  }
+  if (operatorName) {
+    where.push('operator_name LIKE ?');
+    params.push(`%${operatorName}%`);
+  }
+  if (keyword) {
+    where.push(`(
+      operator_name LIKE ?
+      OR action_label LIKE ?
+      OR action_type LIKE ?
+      OR COALESCE(mode, '') LIKE ?
+      OR COALESCE(row_key, '') LIKE ?
+      OR COALESCE(target_id, '') LIKE ?
+      OR COALESCE(CAST(detail_json AS CHAR), '') LIKE ?
+    )`);
+    const likeKeyword = `%${keyword}%`;
+    params.push(likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword, likeKeyword);
+  }
+
+  const [rows] = await pool.execute(
+    `SELECT id, mode, row_key, action_type, action_label,
+      operator_key, operator_name, target_type, target_id,
+      CAST(before_json AS CHAR) AS before_json,
+      CAST(after_json AS CHAR) AS after_json,
+      CAST(detail_json AS CHAR) AS detail_json,
+      DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at
+     FROM dashboard_operation_logs
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+     ORDER BY created_at DESC, id DESC
+     LIMIT ${limit}`,
+    params
   );
-  if (!result.affectedRows) throw new Error('备注不存在或已删除');
-  return {
-    mode: normalizedMode,
-    noteId: normalizedNoteId,
-    operator: resolvedOperator,
-    updatedAt: new Date().toISOString()
-  };
+  return rows.map(operationLogDto);
 }
 
 async function listSnapshotStatus() {
@@ -806,12 +1457,17 @@ async function listSnapshotStatus() {
 
 module.exports = {
   deleteRowActionNote,
+  listOperationLogs,
   listSnapshotStatus,
   loginOperator,
   loadDashboardSnapshot,
   registerOperator,
   rowKey,
   saveDashboardSnapshot,
+  setBulkRowActionNote,
+  setBulkRowActionOwner,
+  setBulkRowActionStatus,
+  setRowActionOwner,
   setRowActionNote,
   setRowActionStatus,
   updateRowActionNote

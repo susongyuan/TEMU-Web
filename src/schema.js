@@ -1,4 +1,6 @@
-async function initDashboardSchema(db) {
+let dashboardSchemaInitPromise = null;
+
+async function runDashboardSchemaInit(db) {
   await db.query(`
     CREATE TABLE IF NOT EXISTS dashboard_operators (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -111,6 +113,17 @@ async function initDashboardSchema(db) {
     await db.query("ALTER TABLE dashboard_row_actions ADD COLUMN updated_by_operator_name VARCHAR(64) NULL DEFAULT NULL AFTER updated_by_operator_key");
   }
 
+  const rowActionOwnerColumns = [
+    ['manual_owner_name', "ALTER TABLE dashboard_row_actions ADD COLUMN manual_owner_name VARCHAR(64) NULL DEFAULT NULL AFTER updated_by_operator_name"],
+    ['claimed_by_operator_key', "ALTER TABLE dashboard_row_actions ADD COLUMN claimed_by_operator_key VARCHAR(64) NULL DEFAULT NULL AFTER manual_owner_name"],
+    ['claimed_by_operator_name', "ALTER TABLE dashboard_row_actions ADD COLUMN claimed_by_operator_name VARCHAR(64) NULL DEFAULT NULL AFTER claimed_by_operator_key"],
+    ['claimed_at', "ALTER TABLE dashboard_row_actions ADD COLUMN claimed_at TIMESTAMP(3) NULL DEFAULT NULL AFTER claimed_by_operator_name"]
+  ];
+  for (const [column, ddl] of rowActionOwnerColumns) {
+    const [columns] = await db.query(`SHOW COLUMNS FROM dashboard_row_actions LIKE '${column}'`);
+    if (!columns.length) await db.query(ddl);
+  }
+
   await db.query(`
     CREATE TABLE IF NOT EXISTS dashboard_row_action_notes (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -144,6 +157,29 @@ async function initDashboardSchema(db) {
     const [columns] = await db.query(`SHOW COLUMNS FROM dashboard_row_action_notes LIKE '${column}'`);
     if (!columns.length) await db.query(ddl);
   }
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_operation_logs (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      mode VARCHAR(32) NULL DEFAULT NULL,
+      row_key VARCHAR(255) NULL DEFAULT NULL,
+      action_type VARCHAR(64) NOT NULL,
+      action_label VARCHAR(128) NOT NULL,
+      operator_key VARCHAR(64) NULL DEFAULT NULL,
+      operator_name VARCHAR(64) NOT NULL,
+      target_type VARCHAR(64) NULL DEFAULT NULL,
+      target_id VARCHAR(128) NULL DEFAULT NULL,
+      before_json JSON NULL,
+      after_json JSON NULL,
+      detail_json JSON NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      KEY idx_dashboard_operation_logs_created (created_at),
+      KEY idx_dashboard_operation_logs_operator_created (operator_name, created_at),
+      KEY idx_dashboard_operation_logs_mode_row (mode, row_key, created_at),
+      KEY idx_dashboard_operation_logs_action_created (action_type, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
 
   await db.query(`
     INSERT INTO dashboard_operators (operator_key, operator_name)
@@ -197,6 +233,109 @@ async function initDashboardSchema(db) {
       OR updated_by_operator_name = ''
       OR updated_by_operator_key IS NULL
   `);
+
+  await db.query(`
+    INSERT INTO dashboard_operation_logs (
+      mode, row_key, action_type, action_label,
+      operator_key, operator_name, target_type, target_id,
+      after_json, detail_json, created_at
+    )
+    SELECT
+      n.mode,
+      n.row_key,
+      'note_create',
+      '新增备注',
+      COALESCE(n.created_by_operator_key, 'legacy-shixiaofang'),
+      COALESCE(NULLIF(n.created_by_operator_name, ''), '石小芳'),
+      'note',
+      CAST(n.id AS CHAR),
+      JSON_OBJECT('note', n.note),
+      JSON_OBJECT('note', n.note, 'historicalBackfill', true),
+      COALESCE(n.created_at, CURRENT_TIMESTAMP(3))
+    FROM dashboard_row_action_notes n
+    WHERE n.deleted_at IS NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM dashboard_operation_logs l
+        WHERE l.action_type = 'note_create'
+          AND l.target_type = 'note'
+          AND CAST(l.target_id AS UNSIGNED) = n.id
+        LIMIT 1
+      )
+  `);
+
+  await db.query(`
+    INSERT INTO dashboard_operation_logs (
+      mode, row_key, action_type, action_label,
+      operator_key, operator_name, target_type, target_id,
+      after_json, detail_json, created_at
+    )
+    SELECT
+      a.mode,
+      a.row_key,
+      'status_update',
+      '处理状态变更',
+      COALESCE(a.updated_by_operator_key, 'legacy-shixiaofang'),
+      COALESCE(NULLIF(a.updated_by_operator_name, ''), '石小芳'),
+      'row_status',
+      a.row_key,
+      JSON_OBJECT('status', a.status),
+      JSON_OBJECT('status', a.status, 'historicalBackfill', true),
+      COALESCE(a.updated_at, a.created_at, CURRENT_TIMESTAMP(3))
+    FROM dashboard_row_actions a
+    WHERE a.status IN ('已完成', '弃用')
+      AND NOT EXISTS (
+        SELECT 1
+        FROM dashboard_operation_logs l
+        WHERE l.action_type = 'status_update'
+          AND l.target_type = 'row_status'
+          AND l.mode COLLATE utf8mb4_unicode_ci = a.mode COLLATE utf8mb4_unicode_ci
+          AND l.row_key COLLATE utf8mb4_unicode_ci = a.row_key COLLATE utf8mb4_unicode_ci
+        LIMIT 1
+      )
+  `);
+
+  await db.query(`
+    INSERT INTO dashboard_operation_logs (
+      mode, row_key, action_type, action_label,
+      operator_key, operator_name, target_type, target_id,
+      after_json, detail_json, created_at
+    )
+    SELECT
+      a.mode,
+      a.row_key,
+      'owner_claim',
+      '认领负责人',
+      COALESCE(a.claimed_by_operator_key, 'legacy-shixiaofang'),
+      COALESCE(NULLIF(a.claimed_by_operator_name, ''), NULLIF(a.manual_owner_name, ''), '石小芳'),
+      'row_owner',
+      a.row_key,
+      JSON_OBJECT('owner', a.manual_owner_name),
+      JSON_OBJECT('owner', a.manual_owner_name, 'historicalBackfill', true),
+      COALESCE(a.claimed_at, a.updated_at, CURRENT_TIMESTAMP(3))
+    FROM dashboard_row_actions a
+    WHERE a.manual_owner_name IS NOT NULL
+      AND TRIM(a.manual_owner_name) <> ''
+      AND NOT EXISTS (
+        SELECT 1
+        FROM dashboard_operation_logs l
+        WHERE l.action_type = 'owner_claim'
+          AND l.target_type = 'row_owner'
+          AND l.mode COLLATE utf8mb4_unicode_ci = a.mode COLLATE utf8mb4_unicode_ci
+          AND l.row_key COLLATE utf8mb4_unicode_ci = a.row_key COLLATE utf8mb4_unicode_ci
+        LIMIT 1
+      )
+  `);
+}
+
+async function initDashboardSchema(db) {
+  if (!dashboardSchemaInitPromise) {
+    dashboardSchemaInitPromise = runDashboardSchemaInit(db).catch(error => {
+      dashboardSchemaInitPromise = null;
+      throw error;
+    });
+  }
+  return dashboardSchemaInitPromise;
 }
 
 module.exports = {

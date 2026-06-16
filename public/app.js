@@ -5,6 +5,9 @@ const state = {
   filtered: [],
   filters: new Map(),
   notePanel: { rowKey: '', editingId: '' },
+  batchNotePanel: { rowKeys: [] },
+  selectedRowKeys: new Set(),
+  operationLogs: [],
   operator: null,
   authResolve: null,
   meta: {},
@@ -15,6 +18,21 @@ const OPERATOR_STORAGE_KEY = 'temuDashboardOperator';
 const UPDATE_STALE_MS = 5 * 60 * 60 * 1000;
 const TABLE_RENDER_LIMIT = 500;
 const SEARCH_DEBOUNCE_MS = 160;
+const OPERATION_LOG_LIMIT = 300;
+const MODE_LABELS = {
+  price: '价格同步',
+  inventory: '库存上下架'
+};
+const OPERATION_ACTION_LABELS = {
+  operator_register: '注册账号',
+  operator_login: '登录账号',
+  owner_claim: '认领负责人',
+  status_update: '处理状态变更',
+  note_create: '新增备注',
+  note_update: '编辑备注',
+  note_delete: '删除备注'
+};
+const MANUAL_STATUSES = ['未处理', '已完成', '弃用'];
 
 const els = {
   title: document.getElementById('pageTitle'),
@@ -29,8 +47,15 @@ const els = {
   runFetchBtn: document.getElementById('runFetchBtn'),
   runInventoryBtn: document.getElementById('runInventoryBtn'),
   operatorBtn: document.getElementById('operatorBtn'),
+  operationLogBtn: document.getElementById('operationLogBtn'),
   exportBtn: document.getElementById('exportBtn'),
   clearFiltersBtn: document.getElementById('clearFiltersBtn'),
+  selectionCount: document.getElementById('selectionCount'),
+  bulkClaimBtn: document.getElementById('bulkClaimBtn'),
+  bulkNoteBtn: document.getElementById('bulkNoteBtn'),
+  bulkDoneBtn: document.getElementById('bulkDoneBtn'),
+  bulkAbandonBtn: document.getElementById('bulkAbandonBtn'),
+  clearSelectionBtn: document.getElementById('clearSelectionBtn'),
   resultCount: document.getElementById('resultCount'),
   priceNav: document.getElementById('priceNav'),
   inventoryNav: document.getElementById('inventoryNav')
@@ -74,7 +99,7 @@ const PAGE_CONFIG = {
       ['platformSpu', '平台SPU'],
       ['skuCode', 'SKU货号'],
       ['skuName', '品名/SKU'],
-      ['owner', '负责人'],
+      ['owner', '负责人', ownerCell],
       ['ownerStatus', '负责人状态', ownerStatusCell],
       ['ownerMatchText', '匹配方式', ownerMatchCell],
       ['storeRegion', '店铺/区域'],
@@ -138,6 +163,7 @@ const PAGE_CONFIG = {
       ['action_required_rows', '需处理', 'warn'],
       ['manual_pending_rows', '未处理', 'warn'],
       ['manual_done_rows', '已完成'],
+      ['manual_abandoned_rows', '弃用'],
       ['active_listing_no_available_stock_rows', '在卖无可用库存', 'danger'],
       ['no_active_listing_with_stock_rows', '有库存无在卖', 'warn'],
       ['other_region_stock_rows', '其他区域有库存']
@@ -153,7 +179,7 @@ const PAGE_CONFIG = {
       { id: 'regionGroup', label: '区域组', kind: 'fixed', options: ['美国/Global', '欧区'] },
       { id: 'status', label: '领星状态', kind: 'field' },
       { id: 'stockAction', label: '处理动作', kind: 'fixed', options: ['有在卖但没可用库存', '有库存但无在卖链接', '库存源异常', '正常'] },
-      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未处理', '已完成', '无需处理'] },
+      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未处理', '已完成', '弃用', '无需处理'] },
       { id: 'warehouseRegionMatchStatus', label: '仓库地区', kind: 'fixed', options: ['同区匹配', '其他区域有库存', '无库存记录'] },
       { id: 'warehouseSource', label: '仓库来源', kind: 'splitField' }
     ],
@@ -168,7 +194,7 @@ const PAGE_CONFIG = {
       ['stockAction', '处理动作', stockActionCell],
       ['manualProcessStatus', '处理状态', manualProcessStatusCell],
       ['skuName', '品名/SKU'],
-      ['owner', '负责人'],
+      ['owner', '负责人', ownerCell],
       ['title', '标题', titleCell],
       ['inventoryAlertReason', '提醒原因'],
       ['status', '领星状态', statusCell],
@@ -337,6 +363,16 @@ function saveOperator(operator) {
   renderOperatorUi();
 }
 
+function clearStoredOperator() {
+  state.operator = null;
+  try {
+    localStorage.removeItem(OPERATOR_STORAGE_KEY);
+  } catch {
+    // 忽略本地存储异常。
+  }
+  renderOperatorUi();
+}
+
 function operatorPayload() {
   return {
     authToken: state.operator?.authToken || '',
@@ -494,8 +530,201 @@ async function promptOperator() {
 }
 
 async function ensureOperator() {
-  if (state.operator?.operatorKey && state.operator?.operatorName) return state.operator;
+  if (state.operator?.operatorKey && state.operator?.operatorName && state.operator?.authToken) return state.operator;
+  alert('请先登录账号后再操作');
   return promptOperator();
+}
+
+function isAuthError(error) {
+  const message = text(error?.message || error);
+  return /登录|账号不存在|Unauthorized|Invalid token/i.test(message);
+}
+
+async function handleActionError(error) {
+  if (isAuthError(error)) {
+    clearStoredOperator();
+    alert('请先登录账号后再操作');
+    await openAuthPanel('login');
+    return;
+  }
+  alert(error.message || String(error));
+}
+
+function ensureOperationLogPanel() {
+  let panel = document.getElementById('operationLogPanel');
+  if (panel) return panel;
+  panel = document.createElement('div');
+  panel.id = 'operationLogPanel';
+  panel.className = 'operation-log-backdrop';
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="operation-log-panel" role="dialog" aria-modal="true" aria-labelledby="operationLogTitle">
+      <div class="operation-log-header">
+        <div>
+          <h2 id="operationLogTitle">操作记录</h2>
+          <p>查看最近的登录、状态处理、备注增删改记录。</p>
+        </div>
+        <button type="button" class="operation-log-close" data-operation-log-action="close">关闭</button>
+      </div>
+      <div class="operation-log-toolbar">
+        <input id="operationLogSearch" type="search" placeholder="搜索操作人 / 动作 / SPU / 备注" />
+        <select id="operationLogModeFilter">
+          <option value="">全部页面</option>
+          <option value="inventory">库存上下架</option>
+          <option value="price">价格同步</option>
+        </select>
+        <select id="operationLogActionFilter">
+          <option value="">全部操作</option>
+          ${Object.entries(OPERATION_ACTION_LABELS).map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('')}
+        </select>
+        <button id="operationLogReload" type="button" class="secondary">刷新</button>
+      </div>
+      <div id="operationLogSummary" class="operation-log-summary">读取中</div>
+      <div class="operation-log-table">
+        <div class="operation-log-row operation-log-head">
+          <span>时间</span>
+          <span>操作人</span>
+          <span>操作</span>
+          <span>对象 / 详情</span>
+        </div>
+        <div id="operationLogList" class="operation-log-list"></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+  panel.addEventListener('click', handleOperationLogClick);
+  panel.querySelector('#operationLogSearch').addEventListener('input', debounce(loadOperationLogs, 260));
+  panel.querySelector('#operationLogModeFilter').addEventListener('change', loadOperationLogs);
+  panel.querySelector('#operationLogActionFilter').addEventListener('change', loadOperationLogs);
+  panel.querySelector('#operationLogReload').addEventListener('click', loadOperationLogs);
+  return panel;
+}
+
+function operationLogPanelElements() {
+  const panel = ensureOperationLogPanel();
+  return {
+    panel,
+    search: panel.querySelector('#operationLogSearch'),
+    mode: panel.querySelector('#operationLogModeFilter'),
+    actionType: panel.querySelector('#operationLogActionFilter'),
+    reload: panel.querySelector('#operationLogReload'),
+    summary: panel.querySelector('#operationLogSummary'),
+    list: panel.querySelector('#operationLogList')
+  };
+}
+
+function openOperationLogPanel() {
+  const els = operationLogPanelElements();
+  els.panel.hidden = false;
+  loadOperationLogs();
+  window.setTimeout(() => els.search.focus(), 0);
+}
+
+function closeOperationLogPanel() {
+  operationLogPanelElements().panel.hidden = true;
+}
+
+function handleOperationLogClick(event) {
+  const action = event.target.closest('[data-operation-log-action]');
+  if (action?.dataset.operationLogAction === 'close') closeOperationLogPanel();
+  if (!action && event.target.id === 'operationLogPanel') closeOperationLogPanel();
+}
+
+function operationLogParams() {
+  const els = operationLogPanelElements();
+  const params = new URLSearchParams({ limit: String(OPERATION_LOG_LIMIT) });
+  if (text(els.mode.value)) params.set('mode', text(els.mode.value));
+  if (text(els.actionType.value)) params.set('actionType', text(els.actionType.value));
+  if (text(els.search.value)) params.set('keyword', text(els.search.value));
+  return params;
+}
+
+async function loadOperationLogs() {
+  const els = operationLogPanelElements();
+  els.reload.disabled = true;
+  els.summary.textContent = '读取中';
+  try {
+    const response = await fetch(`/api/operation-logs?${operationLogParams().toString()}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '操作记录读取失败');
+    state.operationLogs = payload.data || [];
+    renderOperationLogs();
+  } catch (error) {
+    els.list.innerHTML = `<div class="operation-log-empty">${escapeHtml(error.message)}</div>`;
+    els.summary.textContent = '读取失败';
+  } finally {
+    els.reload.disabled = false;
+  }
+}
+
+function modeLabel(mode) {
+  return MODE_LABELS[mode] || mode || '全局';
+}
+
+function actionLabel(log) {
+  return log.actionLabel || OPERATION_ACTION_LABELS[log.actionType] || log.actionType || '';
+}
+
+function cleanRowKey(value) {
+  return text(value).replace(/^(spu|skc|sku-id|sku|mall-goods|goods|id):/i, '');
+}
+
+function operationTarget(log) {
+  const parts = [
+    modeLabel(log.mode),
+    cleanRowKey(log.rowKey || log.targetId)
+  ].filter(Boolean);
+  return parts.join(' / ');
+}
+
+function operationDetail(log) {
+  const detail = log.detail || {};
+  const before = log.before || {};
+  const after = log.after || {};
+  if (log.actionType === 'status_update') {
+    const beforeStatus = text(before.status);
+    const afterStatus = text(after.status || detail.status);
+    return beforeStatus && beforeStatus !== afterStatus ? `${beforeStatus} -> ${afterStatus}` : afterStatus;
+  }
+  if (log.actionType === 'note_create') return text(detail.note || after.note);
+  if (log.actionType === 'note_update') {
+    const beforeNote = text(detail.beforeNote || before.note);
+    const afterNote = text(detail.afterNote || after.note);
+    return beforeNote && beforeNote !== afterNote ? `备注修改：${beforeNote} -> ${afterNote}` : afterNote;
+  }
+  if (log.actionType === 'note_delete') return `删除备注：${text(detail.note || before.note)}`;
+  if (log.actionType === 'owner_claim') {
+    const beforeOwner = text(before.owner);
+    const afterOwner = text(after.owner || detail.owner);
+    return beforeOwner && beforeOwner !== afterOwner ? `${beforeOwner} -> ${afterOwner}` : `负责人：${afterOwner}`;
+  }
+  if (log.actionType === 'operator_register' || log.actionType === 'operator_login') return text(detail.operatorName || log.operatorName);
+  return Object.keys(detail).length ? JSON.stringify(detail) : '';
+}
+
+function renderOperationLogs() {
+  const els = operationLogPanelElements();
+  const logs = state.operationLogs;
+  els.summary.textContent = `显示最近 ${logs.length} 条记录`;
+  if (!logs.length) {
+    els.list.innerHTML = '<div class="operation-log-empty">暂无操作记录</div>';
+    return;
+  }
+  els.list.innerHTML = logs.map(log => {
+    const detail = operationDetail(log);
+    const target = operationTarget(log);
+    return `
+      <div class="operation-log-row">
+        <time>${escapeHtml(formatDateTime(log.createdAt))}</time>
+        <strong>${escapeHtml(log.operatorName || '系统')}</strong>
+        <span>${escapeHtml(actionLabel(log))}</span>
+        <div class="operation-log-detail">
+          ${target ? `<b>${escapeHtml(target)}</b>` : ''}
+          ${detail ? `<p>${escapeHtml(detail)}</p>` : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 function sourceText(source) {
@@ -751,6 +980,7 @@ function columnClass(key) {
 }
 
 function rowClass(row) {
+  if (row.manualProcessStatus === '弃用') return 'row-abandoned';
   if (PAGE === 'inventory') {
     if (row.stockAction === '有在卖但没可用库存') return 'row-danger';
     if (row.stockAction === '有库存但无在卖链接' || row.stockAction === '库存源异常') return 'row-warn';
@@ -826,7 +1056,12 @@ function renderFilters() {
 }
 
 function renderTableHead() {
-  els.tableHead.innerHTML = `<tr>${config.columns.map(([key, label]) => `<th class="${columnClass(key)}">${escapeHtml(label)}</th>`).join('')}</tr>`;
+  els.tableHead.innerHTML = `<tr>
+    <th class="col-select">
+      <input id="selectVisibleRows" type="checkbox" aria-label="选择当前显示行" />
+    </th>
+    ${config.columns.map(([key, label]) => `<th class="${columnClass(key)}">${escapeHtml(label)}</th>`).join('')}
+  </tr>`;
 }
 
 function applyFilters() {
@@ -845,19 +1080,86 @@ function updateResultCount() {
   els.resultCount.textContent = state.filtered.length > TABLE_RENDER_LIMIT
     ? `显示 ${shown} / 筛选 ${state.filtered.length} / 全部 ${state.rows.length}`
     : `${state.filtered.length} / ${state.rows.length}`;
+  updateSelectionUi();
 }
 
 function renderTable() {
   const rows = state.filtered.slice(0, TABLE_RENDER_LIMIT);
   if (!rows.length) {
-    els.tableBody.innerHTML = `<tr><td colspan="${config.columns.length}" class="empty">没有符合条件的数据</td></tr>`;
+    els.tableBody.innerHTML = `<tr><td colspan="${config.columns.length + 1}" class="empty">没有符合条件的数据</td></tr>`;
+    updateSelectionUi();
     return;
   }
   els.tableBody.innerHTML = rows.map(row => `
     <tr class="${rowClass(row)}">
+      <td class="col-select">
+        <input
+          type="checkbox"
+          class="row-select-checkbox"
+          data-row-key="${escapeHtml(row._rowKey)}"
+          aria-label="选择 ${escapeHtml(row.platformSpu || row.skuCode || row.title || row._rowKey)}"
+          ${state.selectedRowKeys.has(row._rowKey) ? 'checked' : ''}
+        />
+      </td>
       ${config.columns.map(([key, , render]) => `<td class="${columnClass(key)}">${render ? render(row, key) : defaultCell(row, key)}</td>`).join('')}
     </tr>
   `).join('');
+  updateSelectionUi();
+}
+
+function visibleRowKeys() {
+  return [...new Set(state.filtered.slice(0, TABLE_RENDER_LIMIT).map(row => row._rowKey).filter(Boolean))];
+}
+
+function selectedKeys() {
+  return [...state.selectedRowKeys].filter(Boolean);
+}
+
+function updateSelectionUi() {
+  const keys = selectedKeys();
+  if (els.selectionCount) els.selectionCount.textContent = `已选 ${keys.length}`;
+  for (const button of [els.bulkClaimBtn, els.bulkNoteBtn, els.bulkDoneBtn, els.bulkAbandonBtn, els.clearSelectionBtn]) {
+    if (button) button.disabled = !keys.length;
+  }
+  const headerCheckbox = document.getElementById('selectVisibleRows');
+  if (headerCheckbox) {
+    const visible = visibleRowKeys();
+    const selectedVisible = visible.filter(key => state.selectedRowKeys.has(key));
+    headerCheckbox.checked = Boolean(visible.length && selectedVisible.length === visible.length);
+    headerCheckbox.indeterminate = Boolean(selectedVisible.length && selectedVisible.length < visible.length);
+  }
+}
+
+function toggleVisibleSelection(checked) {
+  for (const key of visibleRowKeys()) {
+    if (checked) state.selectedRowKeys.add(key);
+    else state.selectedRowKeys.delete(key);
+  }
+  renderTable();
+}
+
+function clearSelection() {
+  state.selectedRowKeys.clear();
+  renderTable();
+}
+
+function handleTableInput(event) {
+  const rowCheckbox = event.target.closest('.row-select-checkbox');
+  if (rowCheckbox) {
+    const key = rowCheckbox.dataset.rowKey;
+    if (rowCheckbox.checked) state.selectedRowKeys.add(key);
+    else state.selectedRowKeys.delete(key);
+    updateSelectionUi();
+    return;
+  }
+  if (event.target.id === 'selectVisibleRows') {
+    toggleVisibleSelection(event.target.checked);
+    return;
+  }
+  const statusSelect = event.target.closest('.manual-status-select');
+  if (statusSelect) {
+    updateManualProcessStatus(statusSelect);
+  }
 }
 
 function imageCell(row) {
@@ -880,6 +1182,26 @@ function multilineCell(row, key) {
 function defaultCell(row, key) {
   if (key === 'owner' && !text(row[key])) return pill(EMPTY_OWNER_LABEL, 'muted-pill');
   return `<div class="plain-cell">${escapeHtml(row[key])}</div>`;
+}
+
+function ownerCell(row) {
+  const owner = text(row.owner);
+  const claimedAt = text(row.manualOwnerClaimedAt);
+  const claimedBy = text(row.manualOwnerClaimedBy);
+  return `
+    <div class="owner-cell">
+      <div>
+        ${owner ? `<strong>${escapeHtml(owner)}</strong>` : pill(EMPTY_OWNER_LABEL, 'muted-pill')}
+        ${claimedBy ? `<small>认领：${escapeHtml(claimedBy)}${claimedAt ? ` ${escapeHtml(formatDateTime(claimedAt))}` : ''}</small>` : ''}
+      </div>
+      <button
+        type="button"
+        class="owner-claim-button"
+        data-row-key="${escapeHtml(row._rowKey)}"
+        title="${owner ? '认领到当前登录账号' : '认领为当前登录账号'}"
+      >认领</button>
+    </div>
+  `;
 }
 
 function skuListCell(row, key) {
@@ -1042,18 +1364,18 @@ function stockActionCell(row) {
 function manualProcessStatusCell(row) {
   const status = text(row.manualProcessStatus || '无需处理');
   if (status === '无需处理' || row.manualActionable !== '是') return pill('无需处理', 'muted-pill');
-  const nextStatus = status === '已完成' ? '未处理' : '已完成';
-  const tone = status === '已完成' ? 'is-done' : 'is-pending';
   const operator = text(row.manualActionOperator);
+  const tone = status === '弃用' ? 'is-abandoned' : status === '已完成' ? 'is-done' : 'is-pending';
   return `
     <div class="manual-status-cell">
-      <button
-        type="button"
-        class="manual-status-toggle ${tone}"
+      <select
+        class="manual-status-select ${tone}"
         data-row-key="${escapeHtml(row._rowKey)}"
         data-current-status="${escapeHtml(status)}"
-        title="点击标记为${escapeHtml(nextStatus)}"
-      >${escapeHtml(status)}</button>
+        aria-label="处理状态"
+      >
+        ${MANUAL_STATUSES.map(item => `<option value="${escapeHtml(item)}" ${item === status ? 'selected' : ''}>${escapeHtml(item)}</option>`).join('')}
+      </select>
       ${operator ? `<span>处理人：${escapeHtml(operator)}</span>` : ''}
     </div>
   `;
@@ -1143,15 +1465,18 @@ function handleFilterInput(event) {
   }
 }
 
-async function updateManualProcessStatus(button) {
-  const rowKey = button.dataset.rowKey;
-  const currentStatus = button.dataset.currentStatus;
-  const nextStatus = currentStatus === '已完成' ? '未处理' : '已完成';
+async function updateManualProcessStatus(control) {
+  const rowKey = control.dataset.rowKey;
+  const currentStatus = control.dataset.currentStatus;
+  const nextStatus = text(control.value);
   if (!rowKey) return;
+  if (!MANUAL_STATUSES.includes(nextStatus) || nextStatus === currentStatus) return;
   const operator = await ensureOperator();
-  if (!operator) return;
-  button.disabled = true;
-  button.textContent = '保存中';
+  if (!operator) {
+    control.value = currentStatus;
+    return;
+  }
+  control.disabled = true;
   try {
     const response = await fetch('/api/action-status', {
       method: 'POST',
@@ -1167,19 +1492,41 @@ async function updateManualProcessStatus(button) {
       payload.data?.operator?.operatorName || operator.operatorName
     );
   } catch (error) {
-    alert(error.message);
-    button.disabled = false;
-    button.textContent = currentStatus;
+    await handleActionError(error);
+    control.value = currentStatus;
+  } finally {
+    control.disabled = false;
   }
 }
 
 function updateRowsManualStatus(rowKey, status, updatedAt, operatorName = '') {
   let changed = 0;
   for (const row of state.rows) {
-    if (row._rowKey !== rowKey || row.manualActionable !== '是') continue;
+    if (row._rowKey !== rowKey) continue;
     row.manualProcessStatus = status;
     row.manualActionUpdatedAt = updatedAt;
     row.manualActionOperator = operatorName || row.manualActionOperator || '';
+    if (status === '弃用' || status === '已完成') row.manualActionable = '是';
+    invalidateSearchCache(row);
+    changed += 1;
+  }
+  if (!changed) {
+    loadData().catch(error => alert(error.message));
+    return;
+  }
+  recalcManualMetrics();
+  applyFilters();
+}
+
+function updateRowsManualStatuses(rowKeys, status, updatedAt, operatorName = '') {
+  const keys = new Set(rowKeys);
+  let changed = 0;
+  for (const row of state.rows) {
+    if (!keys.has(row._rowKey)) continue;
+    row.manualProcessStatus = status;
+    row.manualActionUpdatedAt = updatedAt;
+    row.manualActionOperator = operatorName || row.manualActionOperator || '';
+    if (status === '弃用' || status === '已完成') row.manualActionable = '是';
     invalidateSearchCache(row);
     changed += 1;
   }
@@ -1217,6 +1564,189 @@ function updateRowsManualNotes(rowKey, mutator, updatedAt = '') {
 
 function rowByKey(rowKey) {
   return state.rows.find(row => row._rowKey === rowKey) || null;
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message || '提交失败');
+  return payload.data;
+}
+
+function updateRowsOwner(rowKeys, ownerName, operatorName = '', updatedAt = '') {
+  const keys = new Set(rowKeys);
+  let changed = 0;
+  for (const row of state.rows) {
+    if (!keys.has(row._rowKey)) continue;
+    row.owner = ownerName;
+    row.ownerStatus = '已匹配负责人';
+    row.ownerMatchType = '手动认领';
+    row.ownerMatchText = `手动认领：${ownerName}`;
+    row.manualOwnerName = ownerName;
+    row.manualOwnerClaimedBy = operatorName;
+    row.manualOwnerClaimedAt = updatedAt;
+    invalidateSearchCache(row);
+    changed += 1;
+  }
+  if (!changed) {
+    loadData().catch(error => alert(error.message));
+    return;
+  }
+  renderFilters();
+  applyFilters();
+}
+
+function requireSelectedRowKeys() {
+  const keys = selectedKeys();
+  if (!keys.length) {
+    alert('请先勾选需要处理的行');
+    return [];
+  }
+  return keys;
+}
+
+async function claimOwnerForRows(rowKeys) {
+  const keys = [...new Set((rowKeys || []).filter(Boolean))];
+  if (!keys.length) return;
+  const operator = await ensureOperator();
+  if (!operator) return;
+  try {
+    const data = keys.length === 1
+      ? await postJson('/api/action-owner', { mode: PAGE, rowKey: keys[0], ownerName: operator.operatorName, ...operatorPayload() })
+      : await postJson('/api/bulk-action-owner', { mode: PAGE, rowKeys: keys, ownerName: operator.operatorName, ...operatorPayload() });
+    updateRowsOwner(keys, data.ownerName || operator.operatorName, data.operator?.operatorName || operator.operatorName, data.updatedAt || new Date().toISOString());
+    if (keys.length > 1) clearSelection();
+  } catch (error) {
+    await handleActionError(error);
+  }
+}
+
+async function bulkSetStatus(status) {
+  const keys = requireSelectedRowKeys();
+  if (!keys.length) return;
+  const operator = await ensureOperator();
+  if (!operator) return;
+  try {
+    const data = await postJson('/api/bulk-action-status', { mode: PAGE, rowKeys: keys, status, ...operatorPayload() });
+    updateRowsManualStatuses(
+      keys,
+      data.status || status,
+      data.updatedAt || new Date().toISOString(),
+      data.operator?.operatorName || operator.operatorName
+    );
+    clearSelection();
+  } catch (error) {
+    await handleActionError(error);
+  }
+}
+
+function ensureBatchNotePanel() {
+  let panel = document.getElementById('batchNotePanel');
+  if (panel) return panel;
+  panel = document.createElement('div');
+  panel.id = 'batchNotePanel';
+  panel.className = 'note-panel-backdrop';
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="note-panel batch-note-panel" role="dialog" aria-modal="true" aria-labelledby="batchNotePanelTitle">
+      <div class="note-panel-header">
+        <div>
+          <h2 id="batchNotePanelTitle">批量备注</h2>
+          <p id="batchNotePanelMeta"></p>
+        </div>
+        <button type="button" class="note-panel-close" data-batch-note-action="close">关闭</button>
+      </div>
+      <form id="batchNoteForm" class="note-form">
+        <textarea id="batchNoteInput" maxlength="300" rows="5" placeholder="输入要追加到选中行的备注"></textarea>
+        <div class="note-form-actions">
+          <span id="batchNoteCounter">0 / 300</span>
+          <button type="submit" id="batchNoteSubmit">保存批量备注</button>
+        </div>
+      </form>
+    </div>
+  `;
+  document.body.appendChild(panel);
+  panel.addEventListener('click', handleBatchNotePanelClick);
+  panel.querySelector('#batchNoteForm').addEventListener('submit', submitBatchNoteForm);
+  panel.querySelector('#batchNoteInput').addEventListener('input', updateBatchNoteCounter);
+  return panel;
+}
+
+function batchNotePanelElements() {
+  const panel = ensureBatchNotePanel();
+  return {
+    panel,
+    meta: panel.querySelector('#batchNotePanelMeta'),
+    input: panel.querySelector('#batchNoteInput'),
+    counter: panel.querySelector('#batchNoteCounter'),
+    submit: panel.querySelector('#batchNoteSubmit')
+  };
+}
+
+async function openBatchNotePanel() {
+  const keys = requireSelectedRowKeys();
+  if (!keys.length) return;
+  const operator = await ensureOperator();
+  if (!operator) return;
+  const els = batchNotePanelElements();
+  state.batchNotePanel = { rowKeys: keys };
+  els.meta.textContent = `已选 ${keys.length} 个处理对象，备注人：${operator.operatorName}`;
+  els.input.value = '';
+  updateBatchNoteCounter();
+  els.panel.hidden = false;
+  els.input.focus();
+}
+
+function closeBatchNotePanel() {
+  const els = batchNotePanelElements();
+  els.panel.hidden = true;
+  state.batchNotePanel = { rowKeys: [] };
+}
+
+function updateBatchNoteCounter() {
+  const { input, counter } = batchNotePanelElements();
+  counter.textContent = `${input.value.length} / 300`;
+}
+
+function handleBatchNotePanelClick(event) {
+  const action = event.target.closest('[data-batch-note-action]');
+  if (action?.dataset.batchNoteAction === 'close') closeBatchNotePanel();
+  if (!action && event.target.id === 'batchNotePanel') closeBatchNotePanel();
+}
+
+async function submitBatchNoteForm(event) {
+  event.preventDefault();
+  const els = batchNotePanelElements();
+  const rowKeys = state.batchNotePanel.rowKeys || [];
+  const note = text(els.input.value);
+  if (!rowKeys.length) return;
+  if (!note) {
+    alert('备注不能为空');
+    return;
+  }
+  if (note.length > 300) {
+    alert('备注不能超过300字');
+    return;
+  }
+  const operator = await ensureOperator();
+  if (!operator) return;
+  els.submit.disabled = true;
+  els.submit.textContent = '保存中';
+  try {
+    await postJson('/api/bulk-action-note', { mode: PAGE, rowKeys, note, ...operatorPayload() });
+    closeBatchNotePanel();
+    clearSelection();
+    await loadData();
+  } catch (error) {
+    await handleActionError(error);
+  } finally {
+    els.submit.disabled = false;
+    els.submit.textContent = '保存批量备注';
+  }
 }
 
 function ensureNotePanel() {
@@ -1391,7 +1921,7 @@ async function submitNoteForm(event) {
     cancelEditNote();
     updateNotePanelRow();
   } catch (error) {
-    alert(error.message);
+    await handleActionError(error);
   } finally {
     els.submit.disabled = false;
     els.submit.textContent = state.notePanel.editingId ? '保存修改' : '新增备注';
@@ -1415,7 +1945,7 @@ async function deleteNote(noteId) {
     if (String(state.notePanel.editingId) === String(noteId)) cancelEditNote();
     updateNotePanelRow();
   } catch (error) {
-    alert(error.message);
+    await handleActionError(error);
   }
 }
 
@@ -1435,18 +1965,20 @@ function handleNotePanelClick(event) {
 function recalcManualMetrics() {
   state.meta.manual_pending_rows = state.rows.filter(row => row.manualProcessStatus === '未处理').length;
   state.meta.manual_done_rows = state.rows.filter(row => row.manualProcessStatus === '已完成').length;
+  state.meta.manual_abandoned_rows = state.rows.filter(row => row.manualProcessStatus === '弃用').length;
   renderMetrics(state.meta);
 }
 
 function handleTableClick(event) {
+  const ownerButton = event.target.closest('.owner-claim-button');
+  if (ownerButton) {
+    claimOwnerForRows([ownerButton.dataset.rowKey]);
+    return;
+  }
   const noteButton = event.target.closest('.row-note-button');
   if (noteButton) {
     openNotePanel(noteButton.dataset.rowKey);
     return;
-  }
-  const button = event.target.closest('.manual-status-toggle');
-  if (button) {
-    updateManualProcessStatus(button);
   }
 }
 
@@ -1472,6 +2004,8 @@ async function loadData() {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error?.message || '读取失败');
   state.rows = payload.data || [];
+  const availableKeys = new Set(state.rows.map(row => row._rowKey).filter(Boolean));
+  state.selectedRowKeys = new Set([...state.selectedRowKeys].filter(key => availableKeys.has(key)));
   state.meta = payload.meta || {};
   renderMetrics(state.meta);
   renderUpdateStatus(payload);
@@ -1532,11 +2066,14 @@ function exportFiltered() {
 renderPageChrome();
 loadStoredOperator();
 renderOperatorUi();
+updateSelectionUi();
 loadHealth();
 els.searchInput.addEventListener('input', debounce(applyFilters, SEARCH_DEBOUNCE_MS));
 els.filterGrid.addEventListener('click', handleFilterClick);
 els.filterGrid.addEventListener('input', handleFilterInput);
+els.tableHead.addEventListener('change', handleTableInput);
 els.tableBody.addEventListener('click', handleTableClick);
+els.tableBody.addEventListener('change', handleTableInput);
 document.addEventListener('click', event => {
   if (!event.target.closest('.filter-menu')) closeFilterMenus();
 });
@@ -1545,15 +2082,23 @@ document.addEventListener('keydown', event => {
     closeFilterMenus();
     closeNotePanel();
     closeAuthPanel(null);
+    closeOperationLogPanel();
+    closeBatchNotePanel();
   }
 });
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel('login'));
+els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));
 els.runFetchBtn.addEventListener('click', () => postRefresh('/api/refresh/lingxing', els.runFetchBtn, '已提交同步更新', '同步更新领星+库存'));
 els.runInventoryBtn.addEventListener('click', () => postRefresh('/api/refresh/inventory', els.runInventoryBtn, '已提交库存刷新', '仅刷新库存'));
 els.exportBtn.addEventListener('click', exportFiltered);
 els.clearFiltersBtn.addEventListener('click', clearFilters);
+els.bulkClaimBtn?.addEventListener('click', () => claimOwnerForRows(requireSelectedRowKeys()));
+els.bulkNoteBtn?.addEventListener('click', openBatchNotePanel);
+els.bulkDoneBtn?.addEventListener('click', () => bulkSetStatus('已完成'));
+els.bulkAbandonBtn?.addEventListener('click', () => bulkSetStatus('弃用'));
+els.clearSelectionBtn?.addEventListener('click', clearSelection);
 
 loadData().catch(error => {
   els.updateStatus.textContent = `读取失败：${error.message}`;
