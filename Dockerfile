@@ -14,6 +14,7 @@ COPY src ./src
 COPY public ./public
 COPY scripts/init_db.js ./scripts/init_db.js
 COPY scripts/provision_dashboard_operators.js ./scripts/provision_dashboard_operators.js
+COPY scripts/backfill_action_authors_from_owner.js ./scripts/backfill_action_authors_from_owner.js
 
 EXPOSE 3106
 CMD ["sh", "-c", "node scripts/init_db.js && node src/server.js"]

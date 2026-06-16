@@ -5,7 +5,8 @@
     "start": "node src/server.js",
     "init:db": "node scripts/init_db.js",
     "import:db": "node scripts/import_dashboard_snapshot.js",
-    "operators:provision": "node scripts/provision_dashboard_operators.js"
+    "operators:provision": "node scripts/provision_dashboard_operators.js",
+    "authors:sync": "node scripts/backfill_action_authors_from_owner.js"
   },
   "dependencies": {
     "compression": "^1.8.1",
