@@ -5,10 +5,13 @@ const state = {
   filtered: [],
   filters: new Map(),
   notePanel: { rowKey: '', editingId: '' },
+  operator: null,
+  authResolve: null,
   meta: {},
   health: null
 };
 
+const OPERATOR_STORAGE_KEY = 'temuDashboardOperator';
 const UPDATE_STALE_MS = 5 * 60 * 60 * 1000;
 const TABLE_RENDER_LIMIT = 500;
 const SEARCH_DEBOUNCE_MS = 160;
@@ -25,6 +28,7 @@ const els = {
   refreshBtn: document.getElementById('refreshBtn'),
   runFetchBtn: document.getElementById('runFetchBtn'),
   runInventoryBtn: document.getElementById('runInventoryBtn'),
+  operatorBtn: document.getElementById('operatorBtn'),
   exportBtn: document.getElementById('exportBtn'),
   clearFiltersBtn: document.getElementById('clearFiltersBtn'),
   resultCount: document.getElementById('resultCount'),
@@ -203,7 +207,9 @@ const PAGE_CONFIG = {
       ['image', '图片'],
       ['stockAction', '处理动作'],
       ['manualProcessStatus', '处理状态'],
+      ['manualActionOperator', '处理人'],
       ['manualActionUpdatedAt', '处理时间'],
+      ['manualRemarkAuthors', '备注人'],
       ['manualRemark', '处理备注'],
       ['inventoryAlertReason', '提醒原因'],
       ['skuRegionAlertRepresentative', '提醒代表行'],
@@ -278,6 +284,8 @@ function searchTextForRow(row) {
     'warehouse',
     'inventoryAlertReason',
     'manualProcessStatus',
+    'manualActionOperator',
+    'manualRemarkAuthors',
     'manualRemark'
   ];
   const explicitValues = fields.map(field => row[field]);
@@ -308,6 +316,186 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function loadStoredOperator() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(OPERATOR_STORAGE_KEY) || 'null');
+    if (stored?.operatorKey && stored?.operatorName && stored?.authToken) state.operator = stored;
+  } catch {
+    state.operator = null;
+  }
+}
+
+function saveOperator(operator) {
+  state.operator = operator;
+  try {
+    localStorage.setItem(OPERATOR_STORAGE_KEY, JSON.stringify(operator));
+  } catch {
+    // 浏览器禁用本地存储时，本页内仍可继续使用当前操作人。
+  }
+  renderOperatorUi();
+}
+
+function operatorPayload() {
+  return {
+    authToken: state.operator?.authToken || '',
+    operatorKey: state.operator?.operatorKey || '',
+    operatorName: state.operator?.operatorName || ''
+  };
+}
+
+function renderOperatorUi() {
+  if (!els.operatorBtn) return;
+  const name = text(state.operator?.operatorName);
+  els.operatorBtn.textContent = name ? `操作人：${name}` : '设置操作人';
+  els.operatorBtn.classList.toggle('is-empty', !name);
+  els.operatorBtn.title = name ? '点击切换操作人' : '点击设置操作人后再处理备注和状态';
+}
+
+function ensureAuthPanel() {
+  let panel = document.getElementById('authPanel');
+  if (panel) return panel;
+  panel = document.createElement('div');
+  panel.id = 'authPanel';
+  panel.className = 'auth-panel-backdrop';
+  panel.hidden = true;
+  panel.innerHTML = `
+    <div class="auth-panel" role="dialog" aria-modal="true" aria-labelledby="authPanelTitle">
+      <div class="auth-panel-header">
+        <div>
+          <h2 id="authPanelTitle">登录操作人</h2>
+          <p>用户名填写自己的姓名，后续备注和处理状态会记录到该账号。</p>
+        </div>
+        <button type="button" class="auth-panel-close" data-auth-action="cancel">关闭</button>
+      </div>
+      <form id="authForm" class="auth-form">
+        <label>
+          <span>用户名</span>
+          <input id="authNameInput" type="text" maxlength="32" autocomplete="username" placeholder="例如：石小芳" />
+        </label>
+        <label>
+          <span>密码</span>
+          <input id="authPasswordInput" type="password" autocomplete="current-password" placeholder="请输入密码" />
+        </label>
+        <div class="auth-form-actions">
+          <button type="button" class="secondary" data-auth-action="switch">注册新账号</button>
+          <button type="submit" id="authSubmit">登录</button>
+        </div>
+      </form>
+    </div>
+  `;
+  document.body.appendChild(panel);
+  panel.addEventListener('click', handleAuthPanelClick);
+  panel.querySelector('#authForm').addEventListener('submit', submitAuthForm);
+  return panel;
+}
+
+function authPanelElements() {
+  const panel = ensureAuthPanel();
+  return {
+    panel,
+    title: panel.querySelector('#authPanelTitle'),
+    form: panel.querySelector('#authForm'),
+    nameInput: panel.querySelector('#authNameInput'),
+    passwordInput: panel.querySelector('#authPasswordInput'),
+    switchBtn: panel.querySelector('[data-auth-action="switch"]'),
+    submit: panel.querySelector('#authSubmit')
+  };
+}
+
+function setAuthMode(mode) {
+  const els = authPanelElements();
+  const isRegister = mode === 'register';
+  els.panel.dataset.mode = isRegister ? 'register' : 'login';
+  els.title.textContent = isRegister ? '注册操作人' : '登录操作人';
+  els.submit.textContent = isRegister ? '注册并登录' : '登录';
+  els.switchBtn.textContent = isRegister ? '已有账号，去登录' : '注册新账号';
+  els.passwordInput.autocomplete = isRegister ? 'new-password' : 'current-password';
+}
+
+function openAuthPanel(mode = 'login') {
+  const els = authPanelElements();
+  setAuthMode(mode);
+  els.nameInput.value = text(state.operator?.operatorName);
+  els.passwordInput.value = '';
+  els.panel.hidden = false;
+  window.setTimeout(() => (els.nameInput.value ? els.passwordInput : els.nameInput).focus(), 0);
+  return new Promise(resolve => {
+    state.authResolve = resolve;
+  });
+}
+
+function closeAuthPanel(result = null) {
+  const els = authPanelElements();
+  els.panel.hidden = true;
+  const resolve = state.authResolve;
+  state.authResolve = null;
+  if (resolve) resolve(result);
+}
+
+function handleAuthPanelClick(event) {
+  const action = event.target.closest('[data-auth-action]');
+  if (!action) {
+    if (event.target.id === 'authPanel') closeAuthPanel(null);
+    return;
+  }
+  if (action.dataset.authAction === 'cancel') closeAuthPanel(null);
+  if (action.dataset.authAction === 'switch') {
+    const mode = authPanelElements().panel.dataset.mode === 'register' ? 'login' : 'register';
+    setAuthMode(mode);
+  }
+}
+
+async function submitAuthForm(event) {
+  event.preventDefault();
+  const els = authPanelElements();
+  const operatorName = text(els.nameInput.value);
+  const password = els.passwordInput.value;
+  if (!operatorName) {
+    alert('用户名不能为空');
+    return;
+  }
+  if (!password) {
+    alert('密码不能为空');
+    return;
+  }
+  const mode = els.panel.dataset.mode === 'register' ? 'register' : 'login';
+  els.submit.disabled = true;
+  els.submit.textContent = mode === 'register' ? '注册中' : '登录中';
+  try {
+    const operator = await submitOperatorAuth(mode, operatorName, password);
+    saveOperator(operator);
+    closeAuthPanel(operator);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    els.submit.disabled = false;
+    setAuthMode(mode);
+  }
+}
+
+async function submitOperatorAuth(mode, operatorName, password) {
+  const response = await fetch(mode === 'register' ? '/api/operators/register' : '/api/operators/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ operatorName, password })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message || (mode === 'register' ? '注册失败' : '登录失败'));
+  if (!payload.data?.operatorKey || !payload.data?.operatorName || !payload.data?.authToken) {
+    throw new Error(mode === 'register' ? '注册失败' : '登录失败');
+  }
+  return payload.data;
+}
+
+async function promptOperator() {
+  return openAuthPanel('login');
+}
+
+async function ensureOperator() {
+  if (state.operator?.operatorKey && state.operator?.operatorName) return state.operator;
+  return promptOperator();
 }
 
 function sourceText(source) {
@@ -734,9 +922,15 @@ function manualNotesForRow(row) {
   return [{
     id: '',
     note,
+    createdByName: row.manualRemarkAuthors || row.manualActionOperator || '',
+    updatedByName: row.manualRemarkAuthors || row.manualActionOperator || '',
     createdAt: row.manualActionUpdatedAt || '',
     updatedAt: row.manualActionUpdatedAt || ''
   }];
+}
+
+function noteAuthor(note) {
+  return text(note.createdByName || note.updatedByName);
 }
 
 function noteTimestamp(note) {
@@ -775,7 +969,10 @@ function statusSummaryCell(row, key) {
         <div class="row-note-list">
           ${latestNotes.map(note => `
             <div class="row-note-item" title="${escapeHtml(noteLine(note))}">
-              <span class="row-note-time">${escapeHtml(noteTimestamp(note))}</span>
+              <span class="row-note-time">
+                ${escapeHtml(noteTimestamp(note))}
+                ${noteAuthor(note) ? `<small>${escapeHtml(noteAuthor(note))}</small>` : ''}
+              </span>
               <span class="row-note-text">${escapeHtml(note.note)}</span>
             </div>
           `).join('')}
@@ -847,14 +1044,18 @@ function manualProcessStatusCell(row) {
   if (status === '无需处理' || row.manualActionable !== '是') return pill('无需处理', 'muted-pill');
   const nextStatus = status === '已完成' ? '未处理' : '已完成';
   const tone = status === '已完成' ? 'is-done' : 'is-pending';
+  const operator = text(row.manualActionOperator);
   return `
-    <button
-      type="button"
-      class="manual-status-toggle ${tone}"
-      data-row-key="${escapeHtml(row._rowKey)}"
-      data-current-status="${escapeHtml(status)}"
-      title="点击标记为${escapeHtml(nextStatus)}"
-    >${escapeHtml(status)}</button>
+    <div class="manual-status-cell">
+      <button
+        type="button"
+        class="manual-status-toggle ${tone}"
+        data-row-key="${escapeHtml(row._rowKey)}"
+        data-current-status="${escapeHtml(status)}"
+        title="点击标记为${escapeHtml(nextStatus)}"
+      >${escapeHtml(status)}</button>
+      ${operator ? `<span>处理人：${escapeHtml(operator)}</span>` : ''}
+    </div>
   `;
 }
 
@@ -947,17 +1148,24 @@ async function updateManualProcessStatus(button) {
   const currentStatus = button.dataset.currentStatus;
   const nextStatus = currentStatus === '已完成' ? '未处理' : '已完成';
   if (!rowKey) return;
+  const operator = await ensureOperator();
+  if (!operator) return;
   button.disabled = true;
   button.textContent = '保存中';
   try {
     const response = await fetch('/api/action-status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: PAGE, rowKey, status: nextStatus })
+      body: JSON.stringify({ mode: PAGE, rowKey, status: nextStatus, ...operatorPayload() })
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '处理状态保存失败');
-    updateRowsManualStatus(rowKey, nextStatus, payload.data?.updatedAt || new Date().toISOString());
+    updateRowsManualStatus(
+      rowKey,
+      nextStatus,
+      payload.data?.updatedAt || new Date().toISOString(),
+      payload.data?.operator?.operatorName || operator.operatorName
+    );
   } catch (error) {
     alert(error.message);
     button.disabled = false;
@@ -965,12 +1173,13 @@ async function updateManualProcessStatus(button) {
   }
 }
 
-function updateRowsManualStatus(rowKey, status, updatedAt) {
+function updateRowsManualStatus(rowKey, status, updatedAt, operatorName = '') {
   let changed = 0;
   for (const row of state.rows) {
     if (row._rowKey !== rowKey || row.manualActionable !== '是') continue;
     row.manualProcessStatus = status;
     row.manualActionUpdatedAt = updatedAt;
+    row.manualActionOperator = operatorName || row.manualActionOperator || '';
     invalidateSearchCache(row);
     changed += 1;
   }
@@ -986,7 +1195,8 @@ function setRowNotes(row, notes, updatedAt = '') {
   row.manualNotes = sortManualNotes(notes);
   row.manualNoteCount = row.manualNotes.length;
   row.manualRemark = manualRemarkForNotes(row.manualNotes);
-  row.manualActionUpdatedAt = updatedAt || row.manualNotes[0]?.updatedAt || row.manualNotes[0]?.createdAt || '';
+  row.manualRemarkAuthors = row.manualNotes.map(note => note.createdByName).filter(Boolean).join('\n');
+  row.manualActionUpdatedAt = updatedAt || row.manualNotes[0]?.createdAt || row.manualNotes[0]?.updatedAt || '';
   invalidateSearchCache(row);
 }
 
@@ -1091,7 +1301,10 @@ function renderNoteHistory(row) {
   }
   list.innerHTML = notes.map(note => `
     <article class="note-history-item" data-note-id="${escapeHtml(note.id)}">
-      <time>${escapeHtml(noteTimestamp(note))}</time>
+      <div class="note-history-meta">
+        <time>${escapeHtml(noteTimestamp(note))}</time>
+        ${noteAuthor(note) ? `<span>备注人：${escapeHtml(noteAuthor(note))}</span>` : ''}
+      </div>
       <p>${escapeHtml(note.note)}</p>
       <div class="note-history-actions">
         <button type="button" class="secondary" data-note-action="edit" data-note-id="${escapeHtml(note.id)}">编辑</button>
@@ -1151,6 +1364,8 @@ async function submitNoteForm(event) {
     alert('备注不能超过300字');
     return;
   }
+  const operator = await ensureOperator();
+  if (!operator) return;
 
   const editingId = state.notePanel.editingId;
   els.submit.disabled = true;
@@ -1159,7 +1374,9 @@ async function submitNoteForm(event) {
     const response = await fetch('/api/action-note', {
       method: editingId ? 'PATCH' : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(editingId ? { mode: PAGE, noteId: editingId, note } : { mode: PAGE, rowKey, note })
+      body: JSON.stringify(editingId
+        ? { mode: PAGE, noteId: editingId, note, ...operatorPayload() }
+        : { mode: PAGE, rowKey, note, ...operatorPayload() })
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '备注保存失败');
@@ -1183,12 +1400,14 @@ async function submitNoteForm(event) {
 
 async function deleteNote(noteId) {
   if (!window.confirm('删除这条备注？')) return;
+  const operator = await ensureOperator();
+  if (!operator) return;
   const rowKey = state.notePanel.rowKey;
   try {
     const response = await fetch('/api/action-note', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: PAGE, noteId })
+      body: JSON.stringify({ mode: PAGE, noteId, ...operatorPayload() })
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '备注删除失败');
@@ -1311,6 +1530,8 @@ function exportFiltered() {
 }
 
 renderPageChrome();
+loadStoredOperator();
+renderOperatorUi();
 loadHealth();
 els.searchInput.addEventListener('input', debounce(applyFilters, SEARCH_DEBOUNCE_MS));
 els.filterGrid.addEventListener('click', handleFilterClick);
@@ -1323,9 +1544,11 @@ document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     closeFilterMenus();
     closeNotePanel();
+    closeAuthPanel(null);
   }
 });
 
+els.operatorBtn?.addEventListener('click', () => openAuthPanel('login'));
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));
 els.runFetchBtn.addEventListener('click', () => postRefresh('/api/refresh/lingxing', els.runFetchBtn, '已提交同步更新', '同步更新领星+库存'));
 els.runInventoryBtn.addEventListener('click', () => postRefresh('/api/refresh/inventory', els.runInventoryBtn, '已提交库存刷新', '仅刷新库存'));

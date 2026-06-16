@@ -8,6 +8,8 @@ const {
   deleteRowActionNote,
   loadDashboardSnapshot,
   listSnapshotStatus,
+  loginOperator,
+  registerOperator,
   setRowActionNote,
   setRowActionStatus,
   updateRowActionNote
@@ -175,6 +177,48 @@ app.get('/api/sources', async (req, res) => {
   }
 });
 
+function operatorFromBody(body = {}) {
+  return {
+    authToken: body.authToken || body.token,
+    operatorKey: body.operatorKey,
+    operatorName: body.operatorName
+  };
+}
+
+app.post('/api/operators/register', async (req, res) => {
+  try {
+    const operator = await registerOperator({
+      operatorName: req.body?.operatorName || req.body?.username || req.body?.name,
+      password: req.body?.password
+    });
+    res.json({ data: operator });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'OPERATOR_REGISTER_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
+app.post('/api/operators/login', async (req, res) => {
+  try {
+    const operator = await loginOperator({
+      operatorName: req.body?.operatorName || req.body?.username || req.body?.name,
+      password: req.body?.password
+    });
+    res.json({ data: operator });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'OPERATOR_LOGIN_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 function rejectLocalRefresh(res) {
   res.status(403).json({
     error: {
@@ -237,7 +281,8 @@ app.post('/api/action-status', async (req, res) => {
     const result = await setRowActionStatus({
       mode: req.body?.mode,
       rowKey: req.body?.rowKey,
-      status: req.body?.status
+      status: req.body?.status,
+      operator: operatorFromBody(req.body)
     });
     invalidateDashboardCache(result.mode);
     res.json({ data: result });
@@ -256,7 +301,8 @@ app.post('/api/action-note', async (req, res) => {
     const result = await setRowActionNote({
       mode: req.body?.mode,
       rowKey: req.body?.rowKey,
-      note: req.body?.note
+      note: req.body?.note,
+      operator: operatorFromBody(req.body)
     });
     invalidateDashboardCache(result.mode);
     res.json({ data: result });
@@ -275,7 +321,8 @@ app.patch('/api/action-note', async (req, res) => {
     const result = await updateRowActionNote({
       mode: req.body?.mode,
       noteId: req.body?.noteId,
-      note: req.body?.note
+      note: req.body?.note,
+      operator: operatorFromBody(req.body)
     });
     invalidateDashboardCache(result.mode);
     res.json({ data: result });
@@ -293,7 +340,8 @@ app.delete('/api/action-note', async (req, res) => {
   try {
     const result = await deleteRowActionNote({
       mode: req.body?.mode,
-      noteId: req.body?.noteId
+      noteId: req.body?.noteId,
+      operator: operatorFromBody(req.body)
     });
     invalidateDashboardCache(result.mode);
     res.json({ data: result });
