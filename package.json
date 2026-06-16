@@ -4,7 +4,8 @@
   "scripts": {
     "start": "node src/server.js",
     "init:db": "node scripts/init_db.js",
-    "import:db": "node scripts/import_dashboard_snapshot.js"
+    "import:db": "node scripts/import_dashboard_snapshot.js",
+    "operators:provision": "node scripts/provision_dashboard_operators.js"
   },
   "dependencies": {
     "compression": "^1.8.1",

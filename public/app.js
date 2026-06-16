@@ -81,8 +81,8 @@ const PAGE_CONFIG = {
     filters: [
       { id: 'storeRegion', label: '店铺/区域', kind: 'field' },
       { id: 'owner', label: '负责人', kind: 'splitField' },
-      { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '未匹配负责人'] },
-      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
+      { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '多负责人候选', '未匹配负责人'] },
+      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
       { id: 'storeName', label: '店铺', kind: 'field' },
       { id: 'area', label: '区域', kind: 'field' },
       { id: 'site', label: '站点', kind: 'field' },
@@ -171,8 +171,8 @@ const PAGE_CONFIG = {
     filters: [
       { id: 'storeRegion', label: '店铺/区域', kind: 'field' },
       { id: 'owner', label: '负责人', kind: 'splitField' },
-      { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '未匹配负责人'] },
-      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
+      { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '多负责人候选', '未匹配负责人'] },
+      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
       { id: 'storeName', label: '店铺', kind: 'field' },
       { id: 'area', label: '区域', kind: 'field' },
       { id: 'site', label: '站点', kind: 'field' },
@@ -401,7 +401,7 @@ function ensureAuthPanel() {
       <div class="auth-panel-header">
         <div>
           <h2 id="authPanelTitle">登录操作人</h2>
-          <p>用户名填写自己的姓名，后续备注和处理状态会记录到该账号。</p>
+          <p>使用管理员分配的账号密码登录，后续备注和处理状态会记录到该账号。</p>
         </div>
         <button type="button" class="auth-panel-close" data-auth-action="cancel">关闭</button>
       </div>
@@ -415,7 +415,6 @@ function ensureAuthPanel() {
           <input id="authPasswordInput" type="password" autocomplete="current-password" placeholder="请输入密码" />
         </label>
         <div class="auth-form-actions">
-          <button type="button" class="secondary" data-auth-action="switch">注册新账号</button>
           <button type="submit" id="authSubmit">登录</button>
         </div>
       </form>
@@ -435,24 +434,21 @@ function authPanelElements() {
     form: panel.querySelector('#authForm'),
     nameInput: panel.querySelector('#authNameInput'),
     passwordInput: panel.querySelector('#authPasswordInput'),
-    switchBtn: panel.querySelector('[data-auth-action="switch"]'),
     submit: panel.querySelector('#authSubmit')
   };
 }
 
-function setAuthMode(mode) {
+function setAuthMode() {
   const els = authPanelElements();
-  const isRegister = mode === 'register';
-  els.panel.dataset.mode = isRegister ? 'register' : 'login';
-  els.title.textContent = isRegister ? '注册操作人' : '登录操作人';
-  els.submit.textContent = isRegister ? '注册并登录' : '登录';
-  els.switchBtn.textContent = isRegister ? '已有账号，去登录' : '注册新账号';
-  els.passwordInput.autocomplete = isRegister ? 'new-password' : 'current-password';
+  els.panel.dataset.mode = 'login';
+  els.title.textContent = '登录操作人';
+  els.submit.textContent = '登录';
+  els.passwordInput.autocomplete = 'current-password';
 }
 
-function openAuthPanel(mode = 'login') {
+function openAuthPanel() {
   const els = authPanelElements();
-  setAuthMode(mode);
+  setAuthMode();
   els.nameInput.value = text(state.operator?.operatorName);
   els.passwordInput.value = '';
   els.panel.hidden = false;
@@ -477,10 +473,6 @@ function handleAuthPanelClick(event) {
     return;
   }
   if (action.dataset.authAction === 'cancel') closeAuthPanel(null);
-  if (action.dataset.authAction === 'switch') {
-    const mode = authPanelElements().panel.dataset.mode === 'register' ? 'login' : 'register';
-    setAuthMode(mode);
-  }
 }
 
 async function submitAuthForm(event) {
@@ -496,37 +488,36 @@ async function submitAuthForm(event) {
     alert('密码不能为空');
     return;
   }
-  const mode = els.panel.dataset.mode === 'register' ? 'register' : 'login';
   els.submit.disabled = true;
-  els.submit.textContent = mode === 'register' ? '注册中' : '登录中';
+  els.submit.textContent = '登录中';
   try {
-    const operator = await submitOperatorAuth(mode, operatorName, password);
+    const operator = await submitOperatorAuth(operatorName, password);
     saveOperator(operator);
     closeAuthPanel(operator);
   } catch (error) {
     alert(error.message);
   } finally {
     els.submit.disabled = false;
-    setAuthMode(mode);
+    setAuthMode();
   }
 }
 
-async function submitOperatorAuth(mode, operatorName, password) {
-  const response = await fetch(mode === 'register' ? '/api/operators/register' : '/api/operators/login', {
+async function submitOperatorAuth(operatorName, password) {
+  const response = await fetch('/api/operators/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ operatorName, password })
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error?.message || (mode === 'register' ? '注册失败' : '登录失败'));
+  if (!response.ok) throw new Error(payload.error?.message || '登录失败');
   if (!payload.data?.operatorKey || !payload.data?.operatorName || !payload.data?.authToken) {
-    throw new Error(mode === 'register' ? '注册失败' : '登录失败');
+    throw new Error('登录失败');
   }
   return payload.data;
 }
 
 async function promptOperator() {
-  return openAuthPanel('login');
+  return openAuthPanel();
 }
 
 async function ensureOperator() {
@@ -544,7 +535,7 @@ async function handleActionError(error) {
   if (isAuthError(error)) {
     clearStoredOperator();
     alert('请先登录账号后再操作');
-    await openAuthPanel('login');
+    await openAuthPanel();
     return;
   }
   alert(error.message || String(error));
@@ -613,7 +604,9 @@ function operationLogPanelElements() {
   };
 }
 
-function openOperationLogPanel() {
+async function openOperationLogPanel() {
+  const operator = await ensureOperator();
+  if (!operator) return;
   const els = operationLogPanelElements();
   els.panel.hidden = false;
   loadOperationLogs();
@@ -633,6 +626,7 @@ function handleOperationLogClick(event) {
 function operationLogParams() {
   const els = operationLogPanelElements();
   const params = new URLSearchParams({ limit: String(OPERATION_LOG_LIMIT) });
+  if (state.operator?.authToken) params.set('authToken', state.operator.authToken);
   if (text(els.mode.value)) params.set('mode', text(els.mode.value));
   if (text(els.actionType.value)) params.set('actionType', text(els.actionType.value));
   if (text(els.search.value)) params.set('keyword', text(els.search.value));
@@ -640,6 +634,8 @@ function operationLogParams() {
 }
 
 async function loadOperationLogs() {
+  const operator = await ensureOperator();
+  if (!operator) return;
   const els = operationLogPanelElements();
   els.reload.disabled = true;
   els.summary.textContent = '读取中';
@@ -650,6 +646,10 @@ async function loadOperationLogs() {
     state.operationLogs = payload.data || [];
     renderOperationLogs();
   } catch (error) {
+    if (isAuthError(error)) {
+      await handleActionError(error);
+      return;
+    }
     els.list.innerHTML = `<div class="operation-log-empty">${escapeHtml(error.message)}</div>`;
     els.summary.textContent = '读取失败';
   } finally {
@@ -1331,11 +1331,14 @@ function statusCell(row) {
 }
 
 function ownerStatusCell(row) {
-  return row.ownerStatus === '未匹配负责人' ? pill(row.ownerStatus, 'warn') : pill(row.ownerStatus);
+  if (row.ownerStatus === '未匹配负责人') return pill(row.ownerStatus, 'warn');
+  if (row.ownerStatus === '多负责人候选') return pill(row.ownerStatus, 'warn');
+  return pill(row.ownerStatus);
 }
 
 function ownerMatchCell(row) {
   if (row.ownerMatchType === '模糊产品名') return pill(row.ownerMatchText, 'warn');
+  if (row.ownerStatus === '多负责人候选') return pill(row.ownerMatchText, 'warn');
   if (row.ownerMatchType === '未匹配') return pill(row.ownerMatchText, 'muted-pill');
   return pill(row.ownerMatchText);
 }
@@ -2026,14 +2029,20 @@ async function loadHealth() {
 }
 
 async function postRefresh(url, button, pendingText, normalText) {
+  const operator = await ensureOperator();
+  if (!operator) return;
   button.disabled = true;
   button.textContent = pendingText;
   try {
-    const response = await fetch(url, { method: 'POST' });
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(operatorPayload())
+    });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '提交失败');
   } catch (error) {
-    alert(error.message);
+    await handleActionError(error);
   } finally {
     setTimeout(() => {
       button.disabled = false;
@@ -2087,7 +2096,7 @@ document.addEventListener('keydown', event => {
   }
 });
 
-els.operatorBtn?.addEventListener('click', () => openAuthPanel('login'));
+els.operatorBtn?.addEventListener('click', () => openAuthPanel());
 els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));
 els.runFetchBtn.addEventListener('click', () => postRefresh('/api/refresh/lingxing', els.runFetchBtn, '已提交同步更新', '同步更新领星+库存'));

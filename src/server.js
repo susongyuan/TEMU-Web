@@ -3,6 +3,7 @@ const zlib = require('zlib');
 const { spawn } = require('child_process');
 const express = require('express');
 const compression = require('compression');
+const { getPool } = require('./db');
 const { ensureEnvLoaded } = require('./env');
 const {
   deleteRowActionNote,
@@ -10,7 +11,7 @@ const {
   listOperationLogs,
   listSnapshotStatus,
   loginOperator,
-  registerOperator,
+  resolveOperator,
   setBulkRowActionNote,
   setBulkRowActionOwner,
   setBulkRowActionStatus,
@@ -182,8 +183,22 @@ app.get('/api/sources', async (req, res) => {
   }
 });
 
+function operatorFromRequest(req) {
+  const authorization = String(req.headers.authorization || '');
+  return {
+    authToken:
+      req.query.authToken ||
+      req.query.token ||
+      req.headers['x-auth-token'] ||
+      authorization.replace(/^Bearer\s+/i, ''),
+    operatorKey: req.query.operatorKey,
+    operatorName: req.query.operatorName
+  };
+}
+
 app.get('/api/operation-logs', async (req, res) => {
   try {
+    await resolveOperator(getPool(), operatorFromRequest(req));
     const logs = await listOperationLogs({
       limit: req.query.limit,
       mode: req.query.mode,
@@ -193,7 +208,7 @@ app.get('/api/operation-logs', async (req, res) => {
     });
     res.json({ data: logs });
   } catch (error) {
-    res.status(500).json({
+    res.status(/登录|账号|token/i.test(error.message) ? 401 : 500).json({
       error: {
         code: 'OPERATION_LOGS_LOAD_FAILED',
         message: error.message
@@ -211,20 +226,12 @@ function operatorFromBody(body = {}) {
 }
 
 app.post('/api/operators/register', async (req, res) => {
-  try {
-    const operator = await registerOperator({
-      operatorName: req.body?.operatorName || req.body?.username || req.body?.name,
-      password: req.body?.password
-    });
-    res.json({ data: operator });
-  } catch (error) {
-    res.status(400).json({
-      error: {
-        code: 'OPERATOR_REGISTER_FAILED',
-        message: error.message
-      }
-    });
-  }
+  res.status(403).json({
+    error: {
+      code: 'OPERATOR_REGISTER_DISABLED',
+      message: '账号由管理员统一创建，请使用分配的账号密码登录'
+    }
+  });
 });
 
 app.post('/api/operators/login', async (req, res) => {
@@ -253,52 +260,62 @@ function rejectLocalRefresh(res) {
   });
 }
 
-app.post('/api/refresh/lingxing', (req, res) => {
-  if (!ENABLE_LOCAL_REFRESH) {
-    rejectLocalRefresh(res);
-    return;
+app.post('/api/refresh/lingxing', async (req, res) => {
+  try {
+    await resolveOperator(getPool(), operatorFromBody(req.body));
+    if (!ENABLE_LOCAL_REFRESH) {
+      rejectLocalRefresh(res);
+      return;
+    }
+    if (lingxingRefreshProcess) {
+      res.status(409).json({ error: { code: 'REFRESH_RUNNING', message: '领星刷新正在执行' } });
+      return;
+    }
+
+    lingxingRefreshProcess = spawn(
+      'powershell.exe',
+      ['-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', LINGXING_RUNNER],
+      { cwd: path.dirname(LINGXING_RUNNER), windowsHide: true }
+    );
+
+    lingxingRefreshProcess.on('exit', () => {
+      lingxingRefreshProcess = null;
+      invalidateDashboardCache();
+    });
+
+    res.json({ data: { started: true, runner: LINGXING_RUNNER } });
+  } catch (error) {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: error.message } });
   }
-  if (lingxingRefreshProcess) {
-    res.status(409).json({ error: { code: 'REFRESH_RUNNING', message: '领星刷新正在执行' } });
-    return;
-  }
-
-  lingxingRefreshProcess = spawn(
-    'powershell.exe',
-    ['-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', LINGXING_RUNNER],
-    { cwd: path.dirname(LINGXING_RUNNER), windowsHide: true }
-  );
-
-  lingxingRefreshProcess.on('exit', () => {
-    lingxingRefreshProcess = null;
-    invalidateDashboardCache();
-  });
-
-  res.json({ data: { started: true, runner: LINGXING_RUNNER } });
 });
 
-app.post('/api/refresh/inventory', (req, res) => {
-  if (!ENABLE_LOCAL_REFRESH) {
-    rejectLocalRefresh(res);
-    return;
+app.post('/api/refresh/inventory', async (req, res) => {
+  try {
+    await resolveOperator(getPool(), operatorFromBody(req.body));
+    if (!ENABLE_LOCAL_REFRESH) {
+      rejectLocalRefresh(res);
+      return;
+    }
+    if (inventoryRefreshProcess) {
+      res.status(409).json({ error: { code: 'REFRESH_RUNNING', message: '库存刷新正在执行' } });
+      return;
+    }
+
+    inventoryRefreshProcess = spawn(
+      'powershell.exe',
+      ['-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', WAREHOUSE_RUNNER],
+      { cwd: path.dirname(WAREHOUSE_RUNNER), windowsHide: true }
+    );
+
+    inventoryRefreshProcess.on('exit', () => {
+      inventoryRefreshProcess = null;
+      invalidateDashboardCache('inventory');
+    });
+
+    res.json({ data: { started: true, runner: WAREHOUSE_RUNNER } });
+  } catch (error) {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: error.message } });
   }
-  if (inventoryRefreshProcess) {
-    res.status(409).json({ error: { code: 'REFRESH_RUNNING', message: '库存刷新正在执行' } });
-    return;
-  }
-
-  inventoryRefreshProcess = spawn(
-    'powershell.exe',
-    ['-ExecutionPolicy', 'Bypass', '-NoProfile', '-File', WAREHOUSE_RUNNER],
-    { cwd: path.dirname(WAREHOUSE_RUNNER), windowsHide: true }
-  );
-
-  inventoryRefreshProcess.on('exit', () => {
-    inventoryRefreshProcess = null;
-    invalidateDashboardCache('inventory');
-  });
-
-  res.json({ data: { started: true, runner: WAREHOUSE_RUNNER } });
 });
 
 app.post('/api/action-status', async (req, res) => {

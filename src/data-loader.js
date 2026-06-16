@@ -13,7 +13,7 @@ const LINGXING_INVENTORY_BASENAME = '领星_TEMU_今日全状态_全店铺';
 const LINGXING_PRICE_CSV = path.join(INPUT_DIR, `${LINGXING_PRICE_BASENAME}.csv`);
 const LINGXING_INVENTORY_CSV = path.join(INPUT_DIR, `${LINGXING_INVENTORY_BASENAME}.csv`);
 const WAREHOUSE_INVENTORY_CSV = path.join(WAREHOUSE_DATA_DIR, 'warehouse_inventory_latest.csv');
-const SKU_OWNER_FILES = [
+const STATIC_SKU_OWNER_FILES = [
   path.join(APP_DIR, 'input', '平台SKU_1781161550125.xlsx'),
   path.join(APP_DIR, 'input', 'SKU-运营映射表.xlsx'),
   path.join(INPUT_DIR, 'SKU-运营映射表.xlsx')
@@ -51,6 +51,23 @@ function newest(files) {
   return existing
     .map(file => ({ file, time: fs.statSync(file).mtimeMs }))
     .sort((a, b) => b.time - a.time)[0].file;
+}
+
+function findSkuOwnerFiles() {
+  const dirs = [
+    path.join(APP_DIR, 'input'),
+    INPUT_DIR
+  ];
+  const files = [...STATIC_SKU_OWNER_FILES];
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      if (/^平台SKU_\d+\.xlsx$/i.test(name) || /SKU.*运营.*映射.*\.xlsx$/i.test(name)) {
+        files.push(path.join(dir, name));
+      }
+    }
+  }
+  return [...new Set(files)];
 }
 
 function findLatestLingxingRaw(baseName) {
@@ -354,6 +371,14 @@ function uniqueOwnerMap(setMap) {
   return out;
 }
 
+function allOwnerMap(setMap) {
+  const out = new Map();
+  for (const [key, owners] of setMap.entries()) {
+    if (owners.size) out.set(key, [...owners].join('；'));
+  }
+  return out;
+}
+
 function addToArrayMap(map, key, value) {
   if (!key) return;
   if (!map.has(key)) map.set(key, []);
@@ -380,11 +405,17 @@ function ownerResult(owners, matchType, score = '') {
   const owner = owners.join('；');
   return {
     owner,
-    ownerStatus: owner ? '已匹配负责人' : '未匹配负责人',
+    ownerStatus: owner ? (owners.length > 1 ? '多负责人候选' : '已匹配负责人') : '未匹配负责人',
     ownerMatchType: owner ? matchType : '未匹配',
     ownerMatchScore: score,
     ownerMatchText: owner ? `${matchType}${score ? ` ${score}` : ''}` : '未匹配'
   };
+}
+
+function ownerCandidateResult(owners, matchType, score = '') {
+  const result = ownerResult(owners, matchType, score);
+  if (owners.length > 1) result.ownerMatchText = `${matchType}候选 ${owners.length}人`;
+  return result;
 }
 
 function collectOwnersBySku(skuValues, ownerIndex, keyForSku) {
@@ -415,6 +446,23 @@ function collectOwnersByStoreSku(skuValues, ownerIndex, rowContext = {}) {
             if (owner) addOwnerResult(owners, seen, owner);
           }
         }
+      }
+    }
+  }
+  return owners;
+}
+
+function collectOwnersByRegionSku(skuValues, ownerIndex, rowContext = {}) {
+  const owners = [];
+  const seen = new Set();
+  const region = rowRegionGroup(rowContext);
+  if (!region) return owners;
+  for (const value of skuValues) {
+    for (const sku of extractSkuCodes(value)) {
+      const skuKeys = [normalizeKey(sku), skuPrefix(sku)].filter(Boolean);
+      for (const skuKey of skuKeys) {
+        const owner = ownerIndex.byRegionSku?.get(storeSkuKey('*', region, skuKey));
+        if (owner) addOwnerResult(owners, seen, owner);
       }
     }
   }
@@ -487,28 +535,35 @@ function ownerMatchForSkuValues(skuValues, ownerIndex, nameValues = [], rowConte
 
   const storeSkuOwners = collectOwnersByStoreSku(skuValues, ownerIndex, rowContext);
   if (storeSkuOwners.length) {
-    const result = ownerResult(storeSkuOwners, '店铺SKU');
+    const result = ownerCandidateResult(storeSkuOwners, '店铺SKU');
     ownerIndex.ownerMatchCache.set(matchCacheKey, result);
     return result;
   }
 
   const exactOwners = collectOwnersBySku(skuValues, ownerIndex, sku => normalizeKey(sku));
   if (exactOwners.length) {
-    const result = ownerResult(exactOwners, '精确SKU');
+    const result = ownerCandidateResult(exactOwners, '精确SKU');
+    ownerIndex.ownerMatchCache.set(matchCacheKey, result);
+    return result;
+  }
+
+  const regionSkuOwners = collectOwnersByRegionSku(skuValues, ownerIndex, rowContext);
+  if (regionSkuOwners.length) {
+    const result = ownerCandidateResult(regionSkuOwners, '区域SKU');
     ownerIndex.ownerMatchCache.set(matchCacheKey, result);
     return result;
   }
 
   const prefixOwners = collectOwnersBySku({ [Symbol.iterator]: function* () { yield* skuValues; } }, { get: key => ownerIndex.bySkuPrefix?.get(key) }, skuPrefix);
   if (prefixOwners.length) {
-    const result = ownerResult(prefixOwners, 'SKU前缀');
+    const result = ownerCandidateResult(prefixOwners, 'SKU前缀');
     ownerIndex.ownerMatchCache.set(matchCacheKey, result);
     return result;
   }
 
   const nameOwners = collectOwnersByProductName(nameValues, ownerIndex);
   if (nameOwners.length) {
-    const result = ownerResult(nameOwners, '产品名');
+    const result = ownerCandidateResult(nameOwners, '产品名');
     ownerIndex.ownerMatchCache.set(matchCacheKey, result);
     return result;
   }
@@ -523,7 +578,7 @@ function ownerTextForSkuValues(skuValues, ownerIndex, nameValues = [], rowContex
 }
 
 function skuOwnerFile() {
-  return SKU_OWNER_FILES.find(file => fs.existsSync(file)) || '';
+  return newest(findSkuOwnerFiles());
 }
 
 function loadSkuOwnerIndex() {
@@ -536,6 +591,7 @@ function loadSkuOwnerIndex() {
   const index = new Map();
   const exactOwners = new Map();
   const storeSkuOwners = new Map();
+  const regionSkuOwners = new Map();
   const prefixOwners = new Map();
   const productNameOwners = new Map();
   const fuzzyProductNames = [];
@@ -584,6 +640,11 @@ function loadSkuOwnerIndex() {
             addOwnerToSetMap(storeSkuOwners, storeSkuKey(storeToken, '*', prefix), cleanedOwner);
           }
         }
+        if (storeInfo.region) {
+          if (key) addOwnerToSetMap(regionSkuOwners, storeSkuKey('*', storeInfo.region, key), cleanedOwner);
+          const prefix = skuPrefix(item);
+          if (prefix) addOwnerToSetMap(regionSkuOwners, storeSkuKey('*', storeInfo.region, prefix), cleanedOwner);
+        }
       }
     }
     for (const name of splitProductNameValues(productName)) {
@@ -603,9 +664,10 @@ function loadSkuOwnerIndex() {
     }
   }
   for (const [key, owner] of uniqueOwnerMap(exactOwners).entries()) index.set(key, owner);
-  index.byStoreSku = uniqueOwnerMap(storeSkuOwners);
-  index.bySkuPrefix = uniqueOwnerMap(prefixOwners);
-  index.byProductName = uniqueOwnerMap(productNameOwners);
+  index.byStoreSku = allOwnerMap(storeSkuOwners);
+  index.byRegionSku = allOwnerMap(regionSkuOwners);
+  index.bySkuPrefix = allOwnerMap(prefixOwners);
+  index.byProductName = allOwnerMap(productNameOwners);
   index.fuzzyProductNames = fuzzyProductNames;
   index.fuzzyBySkuPrefix = new Map();
   index.fuzzyByGram = new Map();
@@ -663,12 +725,11 @@ function statusText(status) {
 }
 
 function configuredActiveStatusCodes() {
-  return new Set(
-    String(process.env.LINGXING_ACTIVE_STATUS_CODES || '12')
-      .split(/[，,\s]+/)
-      .map(item => item.trim())
-      .filter(Boolean)
-  );
+  const codes = String(process.env.LINGXING_ACTIVE_STATUS_CODES || '12')
+    .split(/[，,\s]+/)
+    .map(item => item.trim())
+    .filter(item => item && item !== '10');
+  return new Set(codes.length ? codes : ['12']);
 }
 
 function isActiveStatus(status) {

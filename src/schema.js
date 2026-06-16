@@ -9,6 +9,7 @@ async function runDashboardSchemaInit(db) {
       password_salt VARCHAR(128) NULL DEFAULT NULL,
       password_hash VARCHAR(256) NULL DEFAULT NULL,
       password_updated_at TIMESTAMP(3) NULL DEFAULT NULL,
+      disabled_at TIMESTAMP(3) NULL DEFAULT NULL,
       last_seen_at TIMESTAMP(3) NULL DEFAULT NULL,
       created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
       updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -21,7 +22,8 @@ async function runDashboardSchemaInit(db) {
   const operatorPasswordColumns = [
     ['password_salt', "ALTER TABLE dashboard_operators ADD COLUMN password_salt VARCHAR(128) NULL DEFAULT NULL AFTER operator_name"],
     ['password_hash', "ALTER TABLE dashboard_operators ADD COLUMN password_hash VARCHAR(256) NULL DEFAULT NULL AFTER password_salt"],
-    ['password_updated_at', "ALTER TABLE dashboard_operators ADD COLUMN password_updated_at TIMESTAMP(3) NULL DEFAULT NULL AFTER password_hash"]
+    ['password_updated_at', "ALTER TABLE dashboard_operators ADD COLUMN password_updated_at TIMESTAMP(3) NULL DEFAULT NULL AFTER password_hash"],
+    ['disabled_at', "ALTER TABLE dashboard_operators ADD COLUMN disabled_at TIMESTAMP(3) NULL DEFAULT NULL AFTER password_updated_at"]
   ];
   for (const [column, ddl] of operatorPasswordColumns) {
     const [columns] = await db.query(`SHOW COLUMNS FROM dashboard_operators LIKE '${column}'`);

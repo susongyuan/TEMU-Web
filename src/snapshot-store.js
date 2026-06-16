@@ -44,6 +44,19 @@ function dateText(value) {
   return String(value);
 }
 
+async function dbDateTime(db) {
+  const [rows] = await db.execute(`SELECT DATE_FORMAT(CURRENT_TIMESTAMP(3), '${MYSQL_DATETIME_FORMAT}') AS now_at`);
+  return rows[0]?.now_at || '';
+}
+
+function tokenStamp(value) {
+  if (!value) return '';
+  const date = value instanceof Date ? value : new Date(value);
+  const time = date.getTime();
+  if (Number.isFinite(time)) return String(time);
+  return String(value);
+}
+
 function normalizeOperatorName(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
@@ -104,6 +117,7 @@ function issueAuthToken(operator) {
     v: TOKEN_VERSION,
     operatorKey: operator.operatorKey,
     operatorName: operator.operatorName,
+    passwordUpdatedAt: tokenStamp(operator.passwordUpdatedAt || operator.password_updated_at),
     iat: Date.now()
   };
   const payloadPart = base64UrlJson(payload);
@@ -133,6 +147,7 @@ function operatorDto(row, { includeToken = false } = {}) {
   const operator = {
     operatorKey: row.operator_key,
     operatorName: row.operator_name,
+    passwordUpdatedAt: dateText(row.password_updated_at),
     createdAt: dateText(row.created_at),
     updatedAt: dateText(row.updated_at)
   };
@@ -230,7 +245,7 @@ async function registerOperator({ operatorName, name, password }) {
     );
   }
   const [rows] = await pool.execute(
-    `SELECT operator_key, operator_name,
+    `SELECT operator_key, operator_name, password_updated_at,
       DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
       DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
      FROM dashboard_operators
@@ -250,13 +265,76 @@ async function registerOperator({ operatorName, name, password }) {
   return operator;
 }
 
+async function provisionOperator({ operatorName, name, password, resetKey = true }) {
+  const normalizedName = validateOperatorName(operatorName || name);
+  const normalizedPassword = validatePassword(password);
+  const { passwordSalt, passwordHash } = hashPassword(normalizedPassword);
+  const operatorKey = randomUUID();
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  await pool.execute(
+    `INSERT INTO dashboard_operators (
+       operator_key, operator_name, password_salt, password_hash,
+       password_updated_at, disabled_at, last_seen_at
+     )
+     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3), NULL, NULL)
+     ON DUPLICATE KEY UPDATE
+       operator_key = IF(? = 1, VALUES(operator_key), operator_key),
+       password_salt = VALUES(password_salt),
+       password_hash = VALUES(password_hash),
+       password_updated_at = CURRENT_TIMESTAMP(3),
+       disabled_at = NULL,
+       updated_at = CURRENT_TIMESTAMP(3)`,
+    [
+      operatorKey,
+      normalizedName,
+      passwordSalt,
+      passwordHash,
+      resetKey ? 1 : 0
+    ]
+  );
+  const [rows] = await pool.execute(
+    `SELECT operator_key, operator_name, password_updated_at,
+      DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
+      DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
+     FROM dashboard_operators
+     WHERE operator_name = ?
+     LIMIT 1`,
+    [normalizedName]
+  );
+  return operatorDto(rows[0]);
+}
+
+async function disableOperatorsExcept(operatorNames = []) {
+  const names = [...new Set(operatorNames.map(normalizeOperatorName).filter(Boolean))];
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  if (!names.length) {
+    const [result] = await pool.execute(
+      `UPDATE dashboard_operators
+       SET disabled_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3)
+       WHERE disabled_at IS NULL`
+    );
+    return result.affectedRows || 0;
+  }
+  const placeholders = names.map(() => '?').join(',');
+  const [result] = await pool.execute(
+    `UPDATE dashboard_operators
+     SET disabled_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3)
+     WHERE disabled_at IS NULL
+       AND operator_name NOT IN (${placeholders})`,
+    names
+  );
+  return result.affectedRows || 0;
+}
+
 async function loginOperator({ operatorName, name, password }) {
   const normalizedName = validateOperatorName(operatorName || name);
   const normalizedPassword = validatePassword(password);
   const pool = getPool();
   await initDashboardSchema(pool);
   const [rows] = await pool.execute(
-    `SELECT operator_key, operator_name, password_salt, password_hash,
+    `SELECT operator_key, operator_name, password_salt, password_hash, password_updated_at, disabled_at,
       DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
       DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
      FROM dashboard_operators
@@ -267,6 +345,7 @@ async function loginOperator({ operatorName, name, password }) {
   if (!rows.length || !verifyPassword(normalizedPassword, rows[0].password_salt, rows[0].password_hash)) {
     throw new Error('用户名或密码错误');
   }
+  if (rows[0].disabled_at) throw new Error('账号已停用，请联系管理员');
   await pool.execute(
     'UPDATE dashboard_operators SET last_seen_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3) WHERE operator_key = ?',
     [rows[0].operator_key]
@@ -283,12 +362,13 @@ async function loginOperator({ operatorName, name, password }) {
 }
 
 async function resolveOperator(pool, operator = {}) {
+  await initDashboardSchema(pool);
   const tokenPayload = verifyAuthToken(operator.authToken || operator.token);
   const operatorKey = text(tokenPayload.operatorKey);
   if (!operatorKey) throw new Error('请先登录');
 
   const [rows] = await pool.execute(
-    `SELECT operator_key, operator_name,
+    `SELECT operator_key, operator_name, password_updated_at, disabled_at,
       DATE_FORMAT(created_at, '${MYSQL_DATETIME_FORMAT}') AS created_at,
       DATE_FORMAT(updated_at, '${MYSQL_DATETIME_FORMAT}') AS updated_at
      FROM dashboard_operators
@@ -297,6 +377,10 @@ async function resolveOperator(pool, operator = {}) {
     [operatorKey]
   );
   if (!rows.length) throw new Error('登录账号不存在，请重新登录');
+  if (rows[0].disabled_at) throw new Error('账号已停用，请联系管理员');
+  if (tokenStamp(rows[0].password_updated_at) !== text(tokenPayload.passwordUpdatedAt)) {
+    throw new Error('登录状态已失效，请重新登录');
+  }
   await pool.execute(
     'UPDATE dashboard_operators SET last_seen_at = CURRENT_TIMESTAMP(3), updated_at = CURRENT_TIMESTAMP(3) WHERE operator_key = ?',
     [rows[0].operator_key]
@@ -840,13 +924,14 @@ async function setRowActionStatus({ mode, rowKey: key, status, operator }) {
       after: { status: normalizedStatus },
       detail: { status: normalizedStatus }
     });
+    const updatedAt = await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
       rowKey: normalizedKey,
       status: normalizedStatus,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -919,13 +1004,14 @@ async function setRowActionOwner({ mode, rowKey: key, ownerName, operator }) {
       after: { owner: normalizedOwner },
       detail: { owner: normalizedOwner }
     });
+    const updatedAt = await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
       rowKey: normalizedKey,
       ownerName: normalizedOwner,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -989,6 +1075,7 @@ async function setBulkRowActionStatus({ mode, rowKeys, status, operator }) {
         detail: { status: normalizedStatus, bulk: true, bulkCount: keys.length }
       });
     }
+    const updatedAt = await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
@@ -996,7 +1083,7 @@ async function setBulkRowActionStatus({ mode, rowKeys, status, operator }) {
       status: normalizedStatus,
       count: keys.length,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -1064,6 +1151,7 @@ async function setBulkRowActionOwner({ mode, rowKeys, ownerName, operator }) {
         detail: { owner: normalizedOwner, bulk: true, bulkCount: keys.length }
       });
     }
+    const updatedAt = await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
@@ -1071,7 +1159,7 @@ async function setBulkRowActionOwner({ mode, rowKeys, ownerName, operator }) {
       ownerName: normalizedOwner,
       count: keys.length,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -1147,6 +1235,7 @@ async function setBulkRowActionNote({ mode, rowKeys, note, operator }) {
         }
       });
     }
+    const updatedAt = notes[0]?.createdAt || await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
@@ -1154,7 +1243,7 @@ async function setBulkRowActionNote({ mode, rowKeys, note, operator }) {
       notes,
       count: keys.length,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -1376,13 +1465,14 @@ async function deleteRowActionNote({ mode, noteId, operator }) {
         note: beforeNote.note
       }
     });
+    const updatedAt = await dbDateTime(connection);
     await connection.commit();
     return {
       mode: normalizedMode,
       rowKey: beforeNote.rowKey,
       noteId: normalizedNoteId,
       operator: resolvedOperator,
-      updatedAt: new Date().toISOString()
+      updatedAt
     };
   } catch (error) {
     await connection.rollback();
@@ -1461,7 +1551,10 @@ module.exports = {
   listSnapshotStatus,
   loginOperator,
   loadDashboardSnapshot,
+  disableOperatorsExcept,
+  provisionOperator,
   registerOperator,
+  resolveOperator,
   rowKey,
   saveDashboardSnapshot,
   setBulkRowActionNote,
