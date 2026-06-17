@@ -62,7 +62,8 @@ const els = {
   clearSelectionBtn: document.getElementById('clearSelectionBtn'),
   resultCount: document.getElementById('resultCount'),
   priceNav: document.getElementById('priceNav'),
-  inventoryNav: document.getElementById('inventoryNav')
+  inventoryNav: document.getElementById('inventoryNav'),
+  returnLabelNav: document.getElementById('returnLabelNav')
 };
 
 const PAGE_CONFIG = {
@@ -391,6 +392,7 @@ function renderOperatorUi() {
   els.operatorBtn.textContent = name ? `操作人：${name}` : '设置操作人';
   els.operatorBtn.classList.toggle('is-empty', !name);
   els.operatorBtn.title = name ? '点击切换操作人' : '点击设置操作人后再处理备注和状态';
+  if (els.returnLabelNav) els.returnLabelNav.href = returnLabelOpenUrl();
 }
 
 function ensureAuthPanel() {
@@ -635,6 +637,15 @@ function operationLogParams() {
   if (text(els.actionType.value)) params.set('actionType', text(els.actionType.value));
   if (text(els.search.value)) params.set('keyword', text(els.search.value));
   return params;
+}
+
+function returnLabelOpenUrl() {
+  const params = new URLSearchParams();
+  if (state.operator?.authToken) params.set('authToken', state.operator.authToken);
+  if (state.operator?.operatorKey) params.set('operatorKey', state.operator.operatorKey);
+  if (state.operator?.operatorName) params.set('operatorName', state.operator.operatorName);
+  const query = params.toString();
+  return query ? `/api/return-label/open?${query}` : '/api/return-label/open';
 }
 
 async function loadOperationLogs() {

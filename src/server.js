@@ -33,6 +33,7 @@ const WAREHOUSE_RUNNER = path.join(APP_DIR, 'modules', 'warehouse-inventory-moni
 const DATA_SOURCE = String(process.env.DATA_SOURCE || 'db').toLowerCase();
 const ENABLE_LOCAL_REFRESH = String(process.env.ENABLE_LOCAL_REFRESH || 'false').toLowerCase() === 'true';
 const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 4 * 60 * 60 * 1000);
+const RETURN_LABEL_APP_URL = process.env.RETURN_LABEL_APP_URL || 'http://127.0.0.1:3206';
 
 const app = express();
 let lingxingRefreshProcess = null;
@@ -249,6 +250,28 @@ app.post('/api/operators/login', async (req, res) => {
       }
     });
   }
+});
+
+app.get('/api/return-label/interface', async (req, res) => {
+  res.json({
+    data: {
+      module: 'return-label',
+      status: 'available',
+      appUrl: RETURN_LABEL_APP_URL,
+      endpoints: [
+        { method: 'GET', path: '/api/return-label/open' }
+      ],
+      historyTable: 'return_label_history'
+    }
+  });
+});
+
+app.get('/api/return-label/open', (req, res) => {
+  const target = new URL(RETURN_LABEL_APP_URL);
+  for (const key of ['authToken', 'operatorKey', 'operatorName']) {
+    if (req.query[key]) target.searchParams.set(key, String(req.query[key]));
+  }
+  res.redirect(302, target.toString());
 });
 
 function rejectLocalRefresh(res) {
