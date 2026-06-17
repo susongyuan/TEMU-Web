@@ -646,7 +646,6 @@ function returnLabelOpenUrl() {
 async function openReturnLabelService() {
   const operator = await ensureOperator();
   if (!operator) return;
-  const popup = window.open('', '_blank', 'noopener,noreferrer');
   const response = await fetch('/api/return-label/handoff', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -655,11 +654,8 @@ async function openReturnLabelService() {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error?.message || '打开退货面单失败');
   const openUrl = payload.data?.openUrl || '/api/return-label/open';
-  if (popup) {
-    popup.location.href = openUrl;
-  } else {
-    window.open(openUrl, '_blank', 'noopener,noreferrer');
-  }
+  const popup = window.open(openUrl, '_blank', 'noopener,noreferrer');
+  if (!popup) window.location.href = openUrl;
 }
 
 async function loadOperationLogs() {

@@ -44,6 +44,18 @@ const dashboardCache = new Map();
 
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
+app.use((error, req, res, next) => {
+  if (error instanceof SyntaxError && error.status === 400 && 'body' in error) {
+    res.status(400).json({
+      error: {
+        code: 'INVALID_JSON',
+        message: '请求 JSON 格式错误'
+      }
+    });
+    return;
+  }
+  next(error);
+});
 app.use(express.static(PUBLIC_DIR));
 
 async function getDashboardData(mode) {
