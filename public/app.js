@@ -640,12 +640,26 @@ function operationLogParams() {
 }
 
 function returnLabelOpenUrl() {
-  const params = new URLSearchParams();
-  if (state.operator?.authToken) params.set('authToken', state.operator.authToken);
-  if (state.operator?.operatorKey) params.set('operatorKey', state.operator.operatorKey);
-  if (state.operator?.operatorName) params.set('operatorName', state.operator.operatorName);
-  const query = params.toString();
-  return query ? `/api/return-label/open?${query}` : '/api/return-label/open';
+  return '/api/return-label/open';
+}
+
+async function openReturnLabelService() {
+  const operator = await ensureOperator();
+  if (!operator) return;
+  const popup = window.open('', '_blank', 'noopener,noreferrer');
+  const response = await fetch('/api/return-label/handoff', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(operatorPayload())
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error?.message || '打开退货面单失败');
+  const openUrl = payload.data?.openUrl || '/api/return-label/open';
+  if (popup) {
+    popup.location.href = openUrl;
+  } else {
+    window.open(openUrl, '_blank', 'noopener,noreferrer');
+  }
 }
 
 async function loadOperationLogs() {
@@ -2150,6 +2164,14 @@ document.addEventListener('visibilitychange', () => {
 });
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel());
+els.returnLabelNav?.addEventListener('click', async event => {
+  event.preventDefault();
+  try {
+    await openReturnLabelService();
+  } catch (error) {
+    alert(error.message);
+  }
+});
 els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));
 els.runFetchBtn.addEventListener('click', () => postRefresh('/api/refresh/lingxing', els.runFetchBtn, '已提交同步更新', '同步更新领星+库存'));

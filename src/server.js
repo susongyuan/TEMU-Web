@@ -1,6 +1,7 @@
 const path = require('path');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
+const { createHash, randomBytes } = require('crypto');
 const express = require('express');
 const compression = require('compression');
 const { getPool } = require('./db');
@@ -34,6 +35,7 @@ const DATA_SOURCE = String(process.env.DATA_SOURCE || 'db').toLowerCase();
 const ENABLE_LOCAL_REFRESH = String(process.env.ENABLE_LOCAL_REFRESH || 'false').toLowerCase() === 'true';
 const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 4 * 60 * 60 * 1000);
 const RETURN_LABEL_APP_URL = process.env.RETURN_LABEL_APP_URL || 'http://127.0.0.1:3206';
+const RETURN_LABEL_HANDOFF_TTL_MS = Number(process.env.RETURN_LABEL_HANDOFF_TTL_MS || 2 * 60 * 1000);
 
 const app = express();
 let lingxingRefreshProcess = null;
@@ -197,6 +199,45 @@ function operatorFromRequest(req) {
   };
 }
 
+function handoffHash(code) {
+  return createHash('sha256').update(String(code || '')).digest('hex');
+}
+
+async function initReturnLabelHandoffTable(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_return_label_handoffs (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      handoff_hash CHAR(64) NOT NULL,
+      operator_key VARCHAR(64) NOT NULL,
+      operator_name VARCHAR(64) NOT NULL,
+      expires_at TIMESTAMP(3) NOT NULL,
+      consumed_at TIMESTAMP(3) NULL DEFAULT NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_dashboard_return_label_handoffs_hash (handoff_hash),
+      KEY idx_dashboard_return_label_handoffs_expires (expires_at),
+      KEY idx_dashboard_return_label_handoffs_operator_created (operator_name, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+}
+
+async function createReturnLabelHandoff(pool, operator) {
+  await initReturnLabelHandoffTable(pool);
+  const code = randomBytes(32).toString('base64url');
+  const expiresAt = new Date(Date.now() + RETURN_LABEL_HANDOFF_TTL_MS);
+  await pool.execute(
+    `INSERT INTO dashboard_return_label_handoffs
+      (handoff_hash, operator_key, operator_name, expires_at)
+     VALUES (?, ?, ?, ?)`,
+    [handoffHash(code), operator.operatorKey, operator.operatorName, expiresAt]
+  );
+  return code;
+}
+
+function returnLabelOpenPath(code = '') {
+  return code ? `/api/return-label/open?handoff=${encodeURIComponent(code)}` : '/api/return-label/open';
+}
+
 app.get('/api/operation-logs', async (req, res) => {
   try {
     await resolveOperator(getPool(), operatorFromRequest(req));
@@ -259,6 +300,7 @@ app.get('/api/return-label/interface', async (req, res) => {
       status: 'available',
       appUrl: RETURN_LABEL_APP_URL,
       endpoints: [
+        { method: 'POST', path: '/api/return-label/handoff' },
         { method: 'GET', path: '/api/return-label/open' }
       ],
       historyTable: 'return_label_history'
@@ -266,12 +308,70 @@ app.get('/api/return-label/interface', async (req, res) => {
   });
 });
 
+app.post('/api/return-label/handoff', async (req, res) => {
+  try {
+    const operator = await resolveOperator(getPool(), operatorFromBody(req.body));
+    const code = await createReturnLabelHandoff(getPool(), operator);
+    res.json({
+      data: {
+        handoffCode: code,
+        openUrl: returnLabelOpenPath(code),
+        appUrl: RETURN_LABEL_APP_URL
+      }
+    });
+  } catch (error) {
+    res.status(401).json({
+      error: {
+        code: 'RETURN_LABEL_HANDOFF_FAILED',
+        message: error.message
+      }
+    });
+  }
+});
+
 app.get('/api/return-label/open', (req, res) => {
   const target = new URL(RETURN_LABEL_APP_URL);
-  for (const key of ['authToken', 'operatorKey', 'operatorName']) {
-    if (req.query[key]) target.searchParams.set(key, String(req.query[key]));
-  }
+  if (req.query.handoff) target.searchParams.set('handoff', String(req.query.handoff));
   res.redirect(302, target.toString());
+});
+
+app.post('/api/return-label/exchange', async (req, res) => {
+  try {
+    await initReturnLabelHandoffTable(getPool());
+    const handoffCode = String(req.body?.handoffCode || req.body?.handoff || '').trim();
+    if (!handoffCode) {
+      throw new Error('缺少一次性跳转凭证');
+    }
+    const handoffHashValue = handoffHash(handoffCode);
+    const [rows] = await getPool().execute(
+      `SELECT operator_key, operator_name, expires_at, consumed_at
+       FROM dashboard_return_label_handoffs
+       WHERE handoff_hash = ?
+       LIMIT 1`,
+      [handoffHashValue]
+    );
+    if (!rows.length) throw new Error('一次性跳转凭证无效，请重新打开入口');
+    const row = rows[0];
+    if (row.consumed_at) throw new Error('一次性跳转凭证已使用，请重新打开入口');
+    if (new Date(row.expires_at).getTime() < Date.now()) throw new Error('一次性跳转凭证已过期，请重新打开入口');
+    await getPool().execute(
+      'UPDATE dashboard_return_label_handoffs SET consumed_at = CURRENT_TIMESTAMP(3) WHERE handoff_hash = ? AND consumed_at IS NULL',
+      [handoffHashValue]
+    );
+    res.json({
+      data: {
+        operatorKey: row.operator_key,
+        operatorName: row.operator_name
+      }
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        code: 'RETURN_LABEL_EXCHANGE_FAILED',
+        message: error.message
+      }
+    });
+  }
 });
 
 function rejectLocalRefresh(res) {
