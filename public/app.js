@@ -11,11 +11,15 @@ const state = {
   operator: null,
   authResolve: null,
   meta: {},
-  health: null
+  health: null,
+  snapshotGeneratedAt: '',
+  loadingData: false,
+  autoRefreshTimer: null
 };
 
 const OPERATOR_STORAGE_KEY = 'temuDashboardOperator';
 const UPDATE_STALE_MS = 5 * 60 * 60 * 1000;
+const AUTO_REFRESH_INTERVAL_MS = 60 * 1000;
 const TABLE_RENDER_LIMIT = 500;
 const SEARCH_DEBOUNCE_MS = 160;
 const OPERATION_LOG_LIMIT = 300;
@@ -2000,21 +2004,30 @@ function debounce(fn, delay) {
   };
 }
 
-async function loadData() {
-  els.sourceLine.textContent = '读取数据中';
-  els.updateStatus.textContent = '读取数据中';
-  const response = await fetch(config.api);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error?.message || '读取失败');
-  state.rows = payload.data || [];
-  const availableKeys = new Set(state.rows.map(row => row._rowKey).filter(Boolean));
-  state.selectedRowKeys = new Set([...state.selectedRowKeys].filter(key => availableKeys.has(key)));
-  state.meta = payload.meta || {};
-  renderMetrics(state.meta);
-  renderUpdateStatus(payload);
-  els.sourceLine.textContent = config.sourceLine(payload);
-  renderFilters();
-  applyFilters();
+async function loadData(options = {}) {
+  if (state.loadingData) return;
+  state.loadingData = true;
+  if (!options.silent) {
+    els.sourceLine.textContent = '读取数据中';
+    els.updateStatus.textContent = '读取数据中';
+  }
+  try {
+    const response = await fetch(config.api);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '读取失败');
+    state.rows = payload.data || [];
+    state.snapshotGeneratedAt = text(payload.generated_at);
+    const availableKeys = new Set(state.rows.map(row => row._rowKey).filter(Boolean));
+    state.selectedRowKeys = new Set([...state.selectedRowKeys].filter(key => availableKeys.has(key)));
+    state.meta = payload.meta || {};
+    renderMetrics(state.meta);
+    renderUpdateStatus(payload);
+    els.sourceLine.textContent = config.sourceLine(payload);
+    renderFilters();
+    applyFilters();
+  } finally {
+    state.loadingData = false;
+  }
 }
 
 async function loadHealth() {
@@ -2026,6 +2039,31 @@ async function loadHealth() {
     state.health = null;
   }
   applyHealthUi();
+}
+
+function healthSnapshotForPage(health = state.health) {
+  return (health?.snapshots || []).find(snapshot => snapshot.mode === PAGE) || null;
+}
+
+async function checkForRemoteUpdate() {
+  try {
+    const response = await fetch('/api/health');
+    const payload = await response.json();
+    if (!response.ok) return;
+    state.health = payload;
+    applyHealthUi();
+    const snapshot = healthSnapshotForPage(payload);
+    const generatedAt = text(snapshot?.generated_at);
+    if (!generatedAt || !state.snapshotGeneratedAt || generatedAt === state.snapshotGeneratedAt) return;
+    await loadData({ silent: true, reason: 'auto-refresh' });
+  } catch {
+    // Keep the current page usable when the health check is temporarily unavailable.
+  }
+}
+
+function startAutoRefresh() {
+  if (state.autoRefreshTimer) window.clearInterval(state.autoRefreshTimer);
+  state.autoRefreshTimer = window.setInterval(checkForRemoteUpdate, AUTO_REFRESH_INTERVAL_MS);
 }
 
 async function postRefresh(url, button, pendingText, normalText) {
@@ -2077,6 +2115,7 @@ loadStoredOperator();
 renderOperatorUi();
 updateSelectionUi();
 loadHealth();
+startAutoRefresh();
 els.searchInput.addEventListener('input', debounce(applyFilters, SEARCH_DEBOUNCE_MS));
 els.filterGrid.addEventListener('click', handleFilterClick);
 els.filterGrid.addEventListener('input', handleFilterInput);
@@ -2094,6 +2133,9 @@ document.addEventListener('keydown', event => {
     closeOperationLogPanel();
     closeBatchNotePanel();
   }
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') checkForRemoteUpdate();
 });
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel());
