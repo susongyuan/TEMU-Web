@@ -44,6 +44,8 @@ services:
       DB_USER: ${DB_USER:-temu_app}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: ${DB_NAME:-temu_monitor}
+      TEMU_OFFICIAL_UPLOAD_TOKEN: ${TEMU_OFFICIAL_UPLOAD_TOKEN:-}
+      TEMU_OFFICIAL_UPLOAD_LIMIT: ${TEMU_OFFICIAL_UPLOAD_LIMIT:-20mb}
 
 volumes:
   temu_mysql_data:

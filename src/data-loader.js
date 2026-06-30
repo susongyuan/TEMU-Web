@@ -1063,6 +1063,138 @@ function fromOfficialPrice(official, index, ownerIndex) {
   };
 }
 
+function fromUploadedOfficialPrice(official, index) {
+  return {
+    id: `price-official-${official.mallId || 'mall'}-${official.goodsId || normalizeKey(official.title) || index}`,
+    sourceSide: 'TEMU官方',
+    image: official.image,
+    platformSpu: '',
+    skuId: '',
+    skcId: '',
+    skuCode: official.skuCode,
+    skuName: official.skuName,
+    owner: '',
+    ownerStatus: '',
+    ownerMatchType: '',
+    ownerMatchScore: '',
+    ownerMatchText: '',
+    status: '',
+    storeName: official.storeName,
+    area: official.area,
+    site: official.site || '',
+    storeRegion: rowStoreRegion(official),
+    mallId: official.mallId,
+    goodsId: official.goodsId,
+    title: '',
+    officialTitle: official.title,
+    category: '',
+    brand: '',
+    lingxingDeclarePrice: '',
+    lingxingDeclareCurrency: '',
+    lingxingActivityPrice: '',
+    referencePrice: '',
+    referencePriceType: '',
+    referenceCurrency: '',
+    officialPrice: official.officialPrice,
+    officialCurrency: official.officialCurrency,
+    officialUrl: official.officialUrl,
+    priceDiff: '',
+    priceDiffRate: '',
+    priceAlert: '官方未匹配领星',
+    priceOver20: '否',
+    matchStatus: '官方未匹配领星',
+    salesAmount: '',
+    orderCount: '',
+    volume: '',
+    salesProfit: ''
+  };
+}
+
+function applyOfficialToPriceRow(row, official, matchStatus) {
+  const ref = referencePrice(row);
+  const status = priceStatus({ ...row, officialPrice: official?.officialPrice || '' });
+  return {
+    ...row,
+    sourceSide: row.sourceSide || '领星',
+    image: row.image || official?.image || '',
+    storeRegion: row.storeRegion || rowStoreRegion(row),
+    mallId: official?.mallId || '',
+    goodsId: official?.goodsId || '',
+    officialTitle: official?.title || '',
+    referencePrice: ref.value === null ? '' : String(ref.value),
+    referencePriceType: ref.type,
+    referenceCurrency: ref.currency,
+    officialPrice: official?.officialPrice || '',
+    officialCurrency: official?.officialCurrency || '',
+    officialUrl: official?.officialUrl || '',
+    priceDiff: status.diff,
+    priceDiffRate: status.diffRate,
+    priceAlert: status.state,
+    priceOver20: status.over20,
+    matchStatus
+  };
+}
+
+function mergeOfficialRowsIntoPriceSnapshot(snapshot, rawOfficialRows) {
+  const officialRows = normalizeOfficial(rawOfficialRows);
+  const officialIndexes = buildOfficialIndexes(officialRows);
+  const sourceRows = Array.isArray(snapshot?.rows) ? snapshot.rows : [];
+  const lingxingRows = sourceRows.filter(row => row.sourceSide !== 'TEMU官方' && row.matchStatus !== '官方未匹配领星');
+  const lingxingIndexes = buildLingxingIndexes(lingxingRows);
+  const usedOfficial = new Set();
+
+  const rows = lingxingRows.map(row => {
+    const titleKey = normalizeKey(row.title);
+    const skuKey = normalizeKey(row.skuCode);
+    const titleMatch = titleKey ? officialIndexes.byTitle.get(titleKey) : null;
+    const skuMatch = !titleMatch && skuKey ? officialIndexes.bySku.get(skuKey) : null;
+    const official = titleMatch || skuMatch || null;
+    if (official) {
+      usedOfficial.add(official);
+      return applyOfficialToPriceRow(row, official, titleMatch ? '标题匹配' : 'SKU匹配');
+    }
+    return applyOfficialToPriceRow(row, null, '领星未匹配官方');
+  });
+
+  for (const [index, official] of officialRows.entries()) {
+    if (usedOfficial.has(official)) continue;
+    const titleKey = normalizeKey(official.title);
+    const skuKey = normalizeKey(official.skuCode);
+    if ((titleKey && lingxingIndexes.byTitle.has(titleKey)) || (skuKey && lingxingIndexes.bySku.has(skuKey))) continue;
+    rows.push(fromUploadedOfficialPrice(official, index));
+  }
+
+  const stores = new Set(rows.map(row => row.storeRegion).filter(Boolean));
+  const now = new Date().toISOString();
+  const summary = {
+    ...(snapshot?.summary || {}),
+    temu_official_rows: officialRows.length,
+    merged_rows: rows.length,
+    matched_rows: rows.filter(row => row.matchStatus === '标题匹配' || row.matchStatus === 'SKU匹配').length,
+    unmatched_lingxing_rows: rows.filter(row => row.matchStatus === '领星未匹配官方').length,
+    unmatched_official_rows: rows.filter(row => row.matchStatus === '官方未匹配领星').length,
+    price_alert_rows: rows.filter(row => row.priceOver20 === '是').length,
+    price_diff_rows: rows.filter(row => row.priceDiff !== '' && Number(row.priceDiff) !== 0).length,
+    store_count: stores.size
+  };
+
+  return {
+    ...(snapshot || {}),
+    generated_at: now,
+    mode: 'price',
+    sources: {
+      ...(snapshot?.sources || {}),
+      temu_official: {
+        type: 'upload',
+        row_count: officialRows.length,
+        updated_at: now
+      }
+    },
+    summary,
+    rows
+  };
+}
+
 function matchPriceRows(lingxingRows, officialRows, ownerIndex) {
   const officialIndexes = buildOfficialIndexes(officialRows);
   const lingxingIndexes = buildLingxingIndexes(lingxingRows);
@@ -1282,6 +1414,7 @@ module.exports = {
   loadDashboardData,
   loadInventoryData,
   loadPriceData,
+  mergeOfficialRowsIntoPriceSnapshot,
   normalizeKey,
   normalizeText,
   ownerMatchForSkuValues,

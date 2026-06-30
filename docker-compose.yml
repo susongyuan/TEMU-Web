@@ -16,5 +16,7 @@ services:
       DB_USER: ${DB_USER:-temu_readonly}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME:-temu_monitor}
+      TEMU_OFFICIAL_UPLOAD_TOKEN: ${TEMU_OFFICIAL_UPLOAD_TOKEN:-}
+      TEMU_OFFICIAL_UPLOAD_LIMIT: ${TEMU_OFFICIAL_UPLOAD_LIMIT:-20mb}
     extra_hosts:
       - "host.docker.internal:host-gateway"

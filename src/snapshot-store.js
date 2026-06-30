@@ -24,7 +24,8 @@ const OPERATION_ACTION_LABELS = {
   note_create: '新增备注',
   note_update: '编辑备注',
   note_delete: '删除备注',
-  sku_owner_mapping_upload: '上传SKU-运营表'
+  sku_owner_mapping_upload: '上传SKU-运营表',
+  temu_official_products_upload: '上传TEMU前端价格'
 };
 const ROW_ACTION_STATUSES = ['未处理', '已完成', '弃用'];
 

@@ -8,6 +8,7 @@ node_modules/
 scripts/*
 !scripts/init_db.js
 !scripts/provision_dashboard_operators.js
+!scripts/backfill_action_authors_from_owner.js
 tools/
 README.md
 *.log

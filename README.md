@@ -82,6 +82,24 @@ powershell -ExecutionPolicy Bypass -NoProfile -File .\scripts\setup_dashboard_ta
 
 当前仓库只保留 `data\temu_official_products.example.csv` 作为字段示例，真实官方数据不提交到 Git。
 
+也可以通过 Web 上传：
+
+- 价格页点击 `上传前端价格`。
+- 支持 `.csv`、`.xlsx`、`.xls`、`.json`。
+- 表头至少包含价格列，以及标题、SKU 货号或商品 ID 之一。
+- 上传后自动覆盖 `data\temu_official_products.csv`，并基于数据库最新 `price` 快照重建价格页数据。
+
+程序上传接口：
+
+```http
+POST /api/temu-official-products/upload
+Authorization: Bearer <操作人authToken或TEMU_OFFICIAL_UPLOAD_TOKEN>
+X-Upload-Filename: temu_front_price.csv
+Content-Type: text/csv
+```
+
+如果使用操作人账号，先调用 `/api/operators/login` 获取 `authToken`。如果给爬虫程序配置专用 token，在服务器 `.env` 里设置 `TEMU_OFFICIAL_UPLOAD_TOKEN`。
+
 ## 部署
 
 Docker 只打包 Web 看板，不包含领星爬虫、仓库刷新脚本、浏览器运行目录、TEMU 前台探测脚本和历史数据。

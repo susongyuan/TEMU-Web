@@ -35,7 +35,8 @@ const OPERATION_ACTION_LABELS = {
   note_create: '新增备注',
   note_update: '编辑备注',
   note_delete: '删除备注',
-  sku_owner_mapping_upload: '上传SKU-运营表'
+  sku_owner_mapping_upload: '上传SKU-运营表',
+  temu_official_products_upload: '上传TEMU前端价格'
 };
 const MANUAL_STATUSES = ['未处理', '已完成', '弃用'];
 
@@ -53,6 +54,8 @@ const els = {
   runInventoryBtn: document.getElementById('runInventoryBtn'),
   operatorBtn: document.getElementById('operatorBtn'),
   operationLogBtn: document.getElementById('operationLogBtn'),
+  uploadOfficialProductsBtn: document.getElementById('uploadOfficialProductsBtn'),
+  officialProductsFileInput: document.getElementById('officialProductsFileInput'),
   uploadOwnerMappingBtn: document.getElementById('uploadOwnerMappingBtn'),
   ownerMappingFileInput: document.getElementById('ownerMappingFileInput'),
   exportBtn: document.getElementById('exportBtn'),
@@ -960,6 +963,7 @@ function renderPageChrome() {
   els.title.textContent = config.title;
   els.priceNav.classList.toggle('active', PAGE === 'price');
   els.inventoryNav.classList.toggle('active', PAGE === 'inventory');
+  if (els.uploadOfficialProductsBtn) els.uploadOfficialProductsBtn.hidden = PAGE !== 'price';
   renderTableHead();
 }
 
@@ -2098,6 +2102,59 @@ function requestOwnerMappingUpload() {
   els.ownerMappingFileInput.click();
 }
 
+function requestOfficialProductsUpload() {
+  if (!els.officialProductsFileInput) return;
+  els.officialProductsFileInput.value = '';
+  els.officialProductsFileInput.click();
+}
+
+function officialUploadContentType(file) {
+  if (/\.json$/i.test(file.name)) return 'application/json';
+  if (/\.csv$/i.test(file.name)) return 'text/csv;charset=utf-8';
+  if (/\.xls$/i.test(file.name)) return 'application/vnd.ms-excel';
+  return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+}
+
+async function uploadOfficialProductsFile(file) {
+  const operator = await ensureOperator();
+  if (!operator || !file) return;
+  if (!/\.(csv|xlsx|xls|json)$/i.test(file.name)) {
+    alert('只支持上传 .csv、.xlsx、.xls、.json 文件');
+    return;
+  }
+
+  const button = els.uploadOfficialProductsBtn;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '上传中';
+  }
+  try {
+    const response = await fetch('/api/temu-official-products/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': officialUploadContentType(file),
+        'Authorization': `Bearer ${operator.authToken}`,
+        'X-Upload-Filename': encodeURIComponent(file.name)
+      },
+      body: file
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '上传失败');
+    const data = payload.data || {};
+    alert(`TEMU前端价格已更新：上传 ${data.rowCount || 0} 行；价格快照 ${data.snapshot?.rowCount || 0} 行`);
+    await loadHealth();
+    await loadData({ reason: 'official-products-upload' });
+  } catch (error) {
+    await handleActionError(error);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '上传前端价格';
+    }
+    if (els.officialProductsFileInput) els.officialProductsFileInput.value = '';
+  }
+}
+
 async function uploadOwnerMappingFile(file) {
   const operator = await ensureOperator();
   if (!operator || !file) return;
@@ -2192,6 +2249,10 @@ document.addEventListener('visibilitychange', () => {
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel());
 els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
+els.uploadOfficialProductsBtn?.addEventListener('click', requestOfficialProductsUpload);
+els.officialProductsFileInput?.addEventListener('change', event => {
+  uploadOfficialProductsFile(event.target.files?.[0]).catch(error => alert(error.message));
+});
 els.uploadOwnerMappingBtn?.addEventListener('click', requestOwnerMappingUpload);
 els.ownerMappingFileInput?.addEventListener('change', event => {
   uploadOwnerMappingFile(event.target.files?.[0]).catch(error => alert(error.message));

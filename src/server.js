@@ -9,7 +9,9 @@ const { getPool } = require('./db');
 const { ensureEnvLoaded } = require('./env');
 const {
   buildSkuOwnerIndexFromFile,
+  csvParse,
   fileInfo,
+  mergeOfficialRowsIntoPriceSnapshot,
   ownerMatchForSkuValues
 } = require('./data-loader');
 const {
@@ -42,6 +44,7 @@ const HOST = process.env.DASHBOARD_HOST || '127.0.0.1';
 const MODULE_DIR = path.resolve(__dirname, '..');
 const APP_DIR = path.resolve(MODULE_DIR, '..', '..');
 const PUBLIC_DIR = path.join(MODULE_DIR, 'public');
+const DATA_DIR = path.join(MODULE_DIR, 'data');
 const LINGXING_RUNNER = path.join(APP_DIR, 'modules', 'lingxing-temu-crawler', 'scripts', 'run_lingxing_fetch.ps1');
 const WAREHOUSE_RUNNER = path.join(APP_DIR, 'modules', 'warehouse-inventory-monitor', 'scripts', 'run_inventory_refresh.ps1');
 const DATA_SOURCE = String(process.env.DATA_SOURCE || 'db').toLowerCase();
@@ -50,6 +53,9 @@ const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 4 * 
 const RETURN_LABEL_APP_URL = process.env.RETURN_LABEL_APP_URL || 'http://127.0.0.1:3206';
 const SKU_OWNER_UPLOAD_DIR = path.join(APP_DIR, 'input');
 const SKU_OWNER_UPLOAD_LIMIT = process.env.SKU_OWNER_UPLOAD_LIMIT || '10mb';
+const OFFICIAL_PRODUCTS_UPLOAD_LIMIT = process.env.TEMU_OFFICIAL_UPLOAD_LIMIT || process.env.OFFICIAL_PRODUCTS_UPLOAD_LIMIT || '20mb';
+const OFFICIAL_PRODUCTS_UPLOAD_TOKEN = process.env.TEMU_OFFICIAL_UPLOAD_TOKEN || process.env.OFFICIAL_PRODUCTS_UPLOAD_TOKEN || '';
+const OFFICIAL_PRODUCTS_FILE = path.join(DATA_DIR, 'temu_official_products.csv');
 
 const app = express();
 let lingxingRefreshProcess = null;
@@ -57,8 +63,79 @@ let inventoryRefreshProcess = null;
 const dashboardCache = new Map();
 
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
 app.use(express.static(PUBLIC_DIR));
+app.post(
+  '/api/temu-official-products/upload',
+  express.raw({
+    type: [
+      'application/json',
+      'application/octet-stream',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/csv',
+      'text/plain'
+    ],
+    limit: OFFICIAL_PRODUCTS_UPLOAD_LIMIT
+  }),
+  async (req, res) => {
+    try {
+      const operator = await resolveOfficialUploadOperator(req);
+      const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+      if (!buffer.length) throw new Error('上传内容不能为空');
+
+      const originalName = firstUploadedFileName(req) || 'temu_official_products.csv';
+      const parsed = parseOfficialProductsUpload(buffer, originalName, String(req.headers['content-type'] || ''));
+      const savedFile = saveOfficialProductsUpload(parsed.rows);
+      const currentSnapshot = await loadRawDashboardSnapshot('price');
+      const data = mergeOfficialRowsIntoPriceSnapshot(currentSnapshot, parsed.rows);
+      const snapshot = await saveDashboardSnapshot(data);
+      invalidateDashboardCache('price');
+
+      await logOperation(getPool(), {
+        mode: 'price',
+        actionType: 'temu_official_products_upload',
+        operator,
+        targetType: 'temu_official_products',
+        targetId: path.basename(savedFile),
+        after: {
+          file: savedFile,
+          uploadedRows: parsed.rowCount,
+          snapshotRows: snapshot.rowCount
+        },
+        detail: {
+          originalName,
+          savedFile: path.basename(savedFile),
+          rowCount: parsed.rowCount,
+          sheetNames: parsed.sheetNames,
+          columns: parsed.columns,
+          snapshot
+        }
+      });
+
+      res.json({
+        data: {
+          uploaded: true,
+          fileName: path.basename(savedFile),
+          rowCount: parsed.rowCount,
+          columns: parsed.columns,
+          sheetNames: parsed.sheetNames,
+          snapshot,
+          operator
+        }
+      });
+    } catch (error) {
+      const unauthorized = /登录|账号|token|授权|TOKEN/i.test(error.message);
+      const validationError = /上传|文件|表头|数据|格式|只支持|不能为空/i.test(error.message);
+      res.status(unauthorized ? 401 : validationError ? 400 : 500).json({
+        error: {
+          code: unauthorized ? 'UNAUTHORIZED' : 'TEMU_OFFICIAL_PRODUCTS_UPLOAD_FAILED',
+          message: error.message
+        }
+      });
+    }
+  }
+);
+app.use(express.json({ limit: '1mb' }));
 
 async function getDashboardData(mode) {
   if (DATA_SOURCE === 'file') {
@@ -215,6 +292,171 @@ function firstUploadedFileName(req) {
   } catch {
     return path.basename(String(raw || ''));
   }
+}
+
+function authorizationBearer(req) {
+  return String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+}
+
+async function resolveOfficialUploadOperator(req) {
+  const bearer = authorizationBearer(req);
+  const uploadToken = String(OFFICIAL_PRODUCTS_UPLOAD_TOKEN || '').trim();
+  if (uploadToken && bearer && bearer === uploadToken) {
+    return {
+      operatorKey: 'api-temu-official-upload',
+      operatorName: 'API上传'
+    };
+  }
+  return resolveOperator(getPool(), operatorFromRequest(req));
+}
+
+function stripBom(value) {
+  return String(value || '').replace(/^\uFEFF/, '');
+}
+
+function rowsFromJsonUpload(buffer) {
+  let parsed;
+  try {
+    parsed = JSON.parse(stripBom(buffer.toString('utf8')));
+  } catch (error) {
+    throw new Error(`JSON解析失败：${error.message}`);
+  }
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed.rows)
+      ? parsed.rows
+      : Array.isArray(parsed.products)
+        ? parsed.products
+        : Array.isArray(parsed.listings)
+          ? parsed.listings
+          : [];
+  if (!rows.length) throw new Error('JSON需要是数组，或包含 rows/products/listings 数组');
+  return rows.map(row => row && typeof row === 'object' ? row : { value: row });
+}
+
+function rowsFromWorkbookUpload(buffer) {
+  let workbook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer', cellDates: false });
+  } catch (error) {
+    throw new Error(`Excel读取失败：${error.message}`);
+  }
+  const rows = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheetRows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '', raw: false });
+    for (const row of sheetRows) rows.push({ ...row, __sheet: sheetName });
+  }
+  if (!rows.length) throw new Error('Excel没有数据行');
+  return { rows, sheetNames: workbook.SheetNames };
+}
+
+function normalizeOfficialUploadRows(rows) {
+  return rows
+    .filter(row => row && typeof row === 'object')
+    .map(row => {
+      const out = {};
+      for (const [key, value] of Object.entries(row)) {
+        if (String(key || '').startsWith('__')) continue;
+        out[String(key || '').trim()] = value === null || value === undefined ? '' : value;
+      }
+      return out;
+    })
+    .filter(row => Object.values(row).some(value => String(value || '').trim()));
+}
+
+function uploadColumnSet(rows) {
+  const columns = [];
+  const seen = new Set();
+  for (const row of rows) {
+    for (const column of Object.keys(row)) {
+      if (!column || seen.has(column)) continue;
+      seen.add(column);
+      columns.push(column);
+    }
+  }
+  return columns;
+}
+
+function validateOfficialUploadRows(rows) {
+  if (!rows.length) throw new Error('上传文件没有可用数据行');
+  const columns = uploadColumnSet(rows);
+  const normalized = columns.map(normalizeUploadHeader);
+  const hasIdentity = normalized.some(header => [
+    '标题',
+    '商品标题',
+    'title',
+    'producttitle',
+    'productname',
+    'listingtitle',
+    'sku',
+    'sku货号',
+    'skucode',
+    'sellersku',
+    '商品id',
+    'goodsid',
+    'productid'
+  ].includes(header));
+  const hasPrice = normalized.some(header => [
+    'temu价格',
+    '官方价格',
+    '价格',
+    'price',
+    'saleprice',
+    'sellingprice',
+    'frontendprice'
+  ].includes(header));
+  if (!hasIdentity) throw new Error('前端价格表需要包含标题、SKU货号或商品ID列');
+  if (!hasPrice) throw new Error('前端价格表需要包含价格列，例如 TEMU价格/官方价格/price');
+  return columns;
+}
+
+function parseOfficialProductsUpload(buffer, fileName, contentType) {
+  const ext = path.extname(fileName || '').toLowerCase();
+  const lowerContentType = String(contentType || '').toLowerCase();
+  let rows = [];
+  let sheetNames = [];
+
+  if (ext === '.json' || lowerContentType.includes('application/json')) {
+    rows = rowsFromJsonUpload(buffer);
+  } else if (['.xlsx', '.xls'].includes(ext) || lowerContentType.includes('spreadsheet') || lowerContentType.includes('ms-excel')) {
+    const workbook = rowsFromWorkbookUpload(buffer);
+    rows = workbook.rows;
+    sheetNames = workbook.sheetNames;
+  } else if (ext === '.csv' || lowerContentType.includes('csv') || lowerContentType.includes('text/plain')) {
+    rows = csvParse(stripBom(buffer.toString('utf8')));
+  } else {
+    throw new Error('只支持上传 .csv、.xlsx、.xls、.json 文件；API上传请带 X-Upload-Filename');
+  }
+
+  const normalizedRows = normalizeOfficialUploadRows(rows);
+  const columns = validateOfficialUploadRows(normalizedRows);
+  return {
+    rows: normalizedRows,
+    rowCount: normalizedRows.length,
+    columns,
+    sheetNames
+  };
+}
+
+function csvEscape(value) {
+  const str = typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '');
+  if (/[",\r\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+}
+
+function officialRowsToCsv(rows) {
+  const columns = uploadColumnSet(rows);
+  const lines = [columns.map(csvEscape).join(',')];
+  for (const row of rows) {
+    lines.push(columns.map(column => csvEscape(row[column])).join(','));
+  }
+  return `\uFEFF${lines.join('\r\n')}`;
+}
+
+function saveOfficialProductsUpload(rows) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(OFFICIAL_PRODUCTS_FILE, officialRowsToCsv(rows), 'utf8');
+  return OFFICIAL_PRODUCTS_FILE;
 }
 
 function inspectSkuOwnerWorkbook(buffer) {
