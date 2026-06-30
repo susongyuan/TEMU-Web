@@ -23,7 +23,8 @@ const OPERATION_ACTION_LABELS = {
   status_update: '处理状态变更',
   note_create: '新增备注',
   note_update: '编辑备注',
-  note_delete: '删除备注'
+  note_delete: '删除备注',
+  sku_owner_mapping_upload: '上传SKU-运营表'
 };
 const ROW_ACTION_STATUSES = ['未处理', '已完成', '弃用'];
 
@@ -547,6 +548,47 @@ async function saveDashboardSnapshot(data) {
   } finally {
     connection.release();
   }
+}
+
+async function loadRawDashboardSnapshot(mode) {
+  const normalizedMode = text(mode) || 'price';
+  const pool = getPool();
+  await initDashboardSchema(pool);
+
+  const [snapshots] = await pool.execute(
+    `SELECT id, mode, generated_at, row_count,
+      CAST(summary_json AS CHAR) AS summary_json,
+      CAST(sources_json AS CHAR) AS sources_json,
+      created_at
+     FROM dashboard_snapshots
+     WHERE mode = ?
+     ORDER BY id DESC
+     LIMIT 1`,
+    [normalizedMode]
+  );
+
+  if (!snapshots.length) {
+    const error = new Error(`数据库暂无 ${normalizedMode} 看板数据，请先在本机运行领星采集入库`);
+    error.code = 'NO_DASHBOARD_SNAPSHOT';
+    throw error;
+  }
+
+  const snapshot = snapshots[0];
+  const [dbRows] = await pool.execute(
+    `SELECT CAST(row_json AS CHAR) AS row_json
+     FROM dashboard_rows
+     WHERE snapshot_id = ?
+     ORDER BY row_index ASC`,
+    [snapshot.id]
+  );
+
+  return {
+    generated_at: snapshot.generated_at,
+    mode: snapshot.mode,
+    sources: parseJson(snapshot.sources_json, {}),
+    summary: parseJson(snapshot.summary_json, {}),
+    rows: dbRows.map(row => parseJson(row.row_json, {}))
+  };
 }
 
 async function loadDashboardSnapshot(mode) {
@@ -1549,9 +1591,11 @@ module.exports = {
   deleteRowActionNote,
   listOperationLogs,
   listSnapshotStatus,
+  loadRawDashboardSnapshot,
   loginOperator,
   loadDashboardSnapshot,
   disableOperatorsExcept,
+  logOperation,
   provisionOperator,
   registerOperator,
   resolveOperator,

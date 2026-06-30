@@ -39,7 +39,6 @@ services:
       DASHBOARD_PORT: 3106
       DATA_SOURCE: db
       ENABLE_LOCAL_REFRESH: "false"
-      RETURN_LABEL_APP_URL: ${RETURN_LABEL_APP_URL:-http://127.0.0.1:3206}
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: ${DB_USER:-temu_app}

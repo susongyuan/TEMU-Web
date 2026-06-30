@@ -1,18 +1,27 @@
+const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
-const { createHash, randomBytes } = require('crypto');
 const express = require('express');
 const compression = require('compression');
+const XLSX = require('xlsx');
 const { getPool } = require('./db');
 const { ensureEnvLoaded } = require('./env');
 const {
+  buildSkuOwnerIndexFromFile,
+  fileInfo,
+  ownerMatchForSkuValues
+} = require('./data-loader');
+const {
   deleteRowActionNote,
+  loadRawDashboardSnapshot,
   loadDashboardSnapshot,
   listOperationLogs,
   listSnapshotStatus,
+  logOperation,
   loginOperator,
   resolveOperator,
+  saveDashboardSnapshot,
   setBulkRowActionNote,
   setBulkRowActionOwner,
   setBulkRowActionStatus,
@@ -21,6 +30,10 @@ const {
   setRowActionStatus,
   updateRowActionNote
 } = require('./snapshot-store');
+const {
+  appendReturnLabelHistory,
+  listReturnLabelHistory
+} = require('./return-label-store');
 
 ensureEnvLoaded();
 
@@ -35,7 +48,8 @@ const DATA_SOURCE = String(process.env.DATA_SOURCE || 'db').toLowerCase();
 const ENABLE_LOCAL_REFRESH = String(process.env.ENABLE_LOCAL_REFRESH || 'false').toLowerCase() === 'true';
 const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 4 * 60 * 60 * 1000);
 const RETURN_LABEL_APP_URL = process.env.RETURN_LABEL_APP_URL || 'http://127.0.0.1:3206';
-const RETURN_LABEL_HANDOFF_TTL_MS = Number(process.env.RETURN_LABEL_HANDOFF_TTL_MS || 2 * 60 * 1000);
+const SKU_OWNER_UPLOAD_DIR = path.join(APP_DIR, 'input');
+const SKU_OWNER_UPLOAD_LIMIT = process.env.SKU_OWNER_UPLOAD_LIMIT || '10mb';
 
 const app = express();
 let lingxingRefreshProcess = null;
@@ -44,18 +58,6 @@ const dashboardCache = new Map();
 
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
-app.use((error, req, res, next) => {
-  if (error instanceof SyntaxError && error.status === 400 && 'body' in error) {
-    res.status(400).json({
-      error: {
-        code: 'INVALID_JSON',
-        message: '请求 JSON 格式错误'
-      }
-    });
-    return;
-  }
-  next(error);
-});
 app.use(express.static(PUBLIC_DIR));
 
 async function getDashboardData(mode) {
@@ -198,6 +200,202 @@ app.get('/api/sources', async (req, res) => {
   }
 });
 
+function normalizeUploadHeader(value) {
+  return String(value || '').toLowerCase().replace(/[^\p{Letter}\p{Number}\u4e00-\u9fa5]+/gu, '');
+}
+
+function firstUploadedFileName(req) {
+  const raw =
+    req.headers['x-upload-filename'] ||
+    req.headers['x-file-name'] ||
+    req.query.filename ||
+    '';
+  try {
+    return path.basename(decodeURIComponent(String(raw || '')));
+  } catch {
+    return path.basename(String(raw || ''));
+  }
+}
+
+function inspectSkuOwnerWorkbook(buffer) {
+  let workbook;
+  try {
+    workbook = XLSX.read(buffer, { type: 'buffer' });
+  } catch (error) {
+    throw new Error(`Excel读取失败：${error.message}`);
+  }
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new Error('Excel没有可读取的工作表');
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+  if (!rows.length) throw new Error('Excel没有数据行');
+
+  const headers = Object.keys(rows[0] || {}).map(normalizeUploadHeader);
+  const skuHeaders = [
+    '平台sku',
+    '平台商品sku',
+    'sellersku',
+    '主sku',
+    'mainsku',
+    'sku',
+    '系统sku',
+    '产品代码',
+    '仓库产品代码'
+  ];
+  const ownerHeaders = ['负责人', '销售负责人', '运营', '运营负责人'];
+  const hasSku = headers.some(header => skuHeaders.includes(header));
+  const hasOwner = headers.some(header => ownerHeaders.includes(header));
+  if (!hasSku || !hasOwner) throw new Error('Excel表头需要包含SKU列和负责人/运营列');
+
+  return {
+    sheetName,
+    rowCount: rows.length,
+    columns: Object.keys(rows[0] || {})
+  };
+}
+
+function saveSkuOwnerUpload(buffer) {
+  fs.mkdirSync(SKU_OWNER_UPLOAD_DIR, { recursive: true });
+  const fileName = 'SKU-运营映射表.xlsx';
+  const file = path.join(SKU_OWNER_UPLOAD_DIR, fileName);
+  fs.writeFileSync(file, buffer);
+  return file;
+}
+
+function ownerMatchForSnapshotRow(mode, row, ownerIndex) {
+  if (mode === 'inventory') {
+    return ownerMatchForSkuValues(
+      [row.skuCode, row.listingSkuCodes, row.listingStockedSkuCodes, row.listingSkuInventory, row.listingSkuDetails],
+      ownerIndex,
+      [row.skuName, row.title, row.listingSkuDetails],
+      row
+    );
+  }
+  return ownerMatchForSkuValues(
+    [row.skuCode],
+    ownerIndex,
+    [row.skuName, row.title, row.officialTitle],
+    row
+  );
+}
+
+function applyOwnerMappingToRows(mode, rows, ownerIndex) {
+  return rows.map(row => {
+    const ownerMatch = ownerMatchForSnapshotRow(mode, row, ownerIndex);
+    return {
+      ...row,
+      owner: ownerMatch.owner,
+      ownerStatus: ownerMatch.ownerStatus,
+      ownerMatchType: ownerMatch.ownerMatchType,
+      ownerMatchScore: ownerMatch.ownerMatchScore,
+      ownerMatchText: ownerMatch.ownerMatchText
+    };
+  });
+}
+
+async function rebuildSnapshotsWithOwnerMapping(mappingFile, workbookInfo) {
+  if (DATA_SOURCE !== 'db') {
+    invalidateDashboardCache();
+    return [];
+  }
+
+  const ownerIndex = buildSkuOwnerIndexFromFile(mappingFile);
+  const generatedAt = new Date().toISOString();
+  const results = [];
+  for (const mode of ['price', 'inventory']) {
+    try {
+      const snapshot = await loadRawDashboardSnapshot(mode);
+      const rows = applyOwnerMappingToRows(mode, snapshot.rows, ownerIndex);
+      const result = await saveDashboardSnapshot({
+        ...snapshot,
+        generated_at: generatedAt,
+        sources: {
+          ...snapshot.sources,
+          sku_owner_mapping: fileInfo(mappingFile)
+        },
+        summary: {
+          ...snapshot.summary,
+          sku_owner_mapping_rows: workbookInfo.rowCount,
+          sku_owner_mapping_sheet: workbookInfo.sheetName,
+          sku_owner_mapping_uploaded_at: generatedAt
+        },
+        rows
+      });
+      results.push(result);
+    } catch (error) {
+      if (error.code !== 'NO_DASHBOARD_SNAPSHOT') throw error;
+      results.push({ mode, skipped: true, message: error.message });
+    }
+  }
+  invalidateDashboardCache();
+  return results;
+}
+
+app.post(
+  '/api/sku-owner-mapping/upload',
+  express.raw({
+    type: [
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/octet-stream'
+    ],
+    limit: SKU_OWNER_UPLOAD_LIMIT
+  }),
+  async (req, res) => {
+    try {
+      const operator = await resolveOperator(getPool(), operatorFromRequest(req));
+      const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+      if (!buffer.length) throw new Error('请选择要上传的Excel文件');
+
+      const originalName = firstUploadedFileName(req);
+      const ext = path.extname(originalName).toLowerCase();
+      if (ext && ext !== '.xlsx') throw new Error('目前只支持上传 .xlsx 文件');
+
+      const workbookInfo = inspectSkuOwnerWorkbook(buffer);
+      const savedFile = saveSkuOwnerUpload(buffer);
+      const snapshots = await rebuildSnapshotsWithOwnerMapping(savedFile, workbookInfo);
+
+      await logOperation(getPool(), {
+        actionType: 'sku_owner_mapping_upload',
+        operator,
+        targetType: 'sku_owner_mapping',
+        targetId: path.basename(savedFile),
+        after: {
+          file: savedFile,
+          rowCount: workbookInfo.rowCount,
+          sheetName: workbookInfo.sheetName
+        },
+        detail: {
+          originalName,
+          savedFile: path.basename(savedFile),
+          rowCount: workbookInfo.rowCount,
+          sheetName: workbookInfo.sheetName,
+          snapshots
+        }
+      });
+
+      res.json({
+        data: {
+          uploaded: true,
+          fileName: path.basename(savedFile),
+          rowCount: workbookInfo.rowCount,
+          sheetName: workbookInfo.sheetName,
+          snapshots,
+          operator
+        }
+      });
+    } catch (error) {
+      const unauthorized = /登录|账号|token/i.test(error.message);
+      const validationError = /请选择|Excel|表头|数据行|只支持/i.test(error.message);
+      res.status(unauthorized ? 401 : validationError ? 400 : 500).json({
+        error: {
+          code: unauthorized ? 'UNAUTHORIZED' : 'SKU_OWNER_MAPPING_UPLOAD_FAILED',
+          message: error.message
+        }
+      });
+    }
+  }
+);
+
 function operatorFromRequest(req) {
   const authorization = String(req.headers.authorization || '');
   return {
@@ -209,45 +407,6 @@ function operatorFromRequest(req) {
     operatorKey: req.query.operatorKey,
     operatorName: req.query.operatorName
   };
-}
-
-function handoffHash(code) {
-  return createHash('sha256').update(String(code || '')).digest('hex');
-}
-
-async function initReturnLabelHandoffTable(pool) {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS dashboard_return_label_handoffs (
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-      handoff_hash CHAR(64) NOT NULL,
-      operator_key VARCHAR(64) NOT NULL,
-      operator_name VARCHAR(64) NOT NULL,
-      expires_at TIMESTAMP(3) NOT NULL,
-      consumed_at TIMESTAMP(3) NULL DEFAULT NULL,
-      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-      PRIMARY KEY (id),
-      UNIQUE KEY uniq_dashboard_return_label_handoffs_hash (handoff_hash),
-      KEY idx_dashboard_return_label_handoffs_expires (expires_at),
-      KEY idx_dashboard_return_label_handoffs_operator_created (operator_name, created_at)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-}
-
-async function createReturnLabelHandoff(pool, operator) {
-  await initReturnLabelHandoffTable(pool);
-  const code = randomBytes(32).toString('base64url');
-  const expiresAt = new Date(Date.now() + RETURN_LABEL_HANDOFF_TTL_MS);
-  await pool.execute(
-    `INSERT INTO dashboard_return_label_handoffs
-      (handoff_hash, operator_key, operator_name, expires_at)
-     VALUES (?, ?, ?, ?)`,
-    [handoffHash(code), operator.operatorKey, operator.operatorName, expiresAt]
-  );
-  return code;
-}
-
-function returnLabelOpenPath(code = '') {
-  return code ? `/api/return-label/open?handoff=${encodeURIComponent(code)}` : '/api/return-label/open';
 }
 
 app.get('/api/operation-logs', async (req, res) => {
@@ -312,74 +471,45 @@ app.get('/api/return-label/interface', async (req, res) => {
       status: 'available',
       appUrl: RETURN_LABEL_APP_URL,
       endpoints: [
-        { method: 'POST', path: '/api/return-label/handoff' },
-        { method: 'GET', path: '/api/return-label/open' }
+        { method: 'GET', path: '/api/return-label/open' },
+        { method: 'GET', path: '/api/return-label/history' },
+        { method: 'POST', path: '/api/return-label/history' }
       ],
       historyTable: 'return_label_history'
     }
   });
 });
 
-app.post('/api/return-label/handoff', async (req, res) => {
+app.get('/api/return-label/open', (req, res) => {
+  res.redirect(302, RETURN_LABEL_APP_URL);
+});
+
+app.get('/api/return-label/history', async (req, res) => {
   try {
-    const operator = await resolveOperator(getPool(), operatorFromBody(req.body));
-    const code = await createReturnLabelHandoff(getPool(), operator);
-    res.json({
-      data: {
-        handoffCode: code,
-        openUrl: returnLabelOpenPath(code),
-        appUrl: RETURN_LABEL_APP_URL
-      }
-    });
+    await resolveOperator(getPool(), operatorFromRequest(req));
+    const history = await listReturnLabelHistory({ limit: req.query.limit });
+    res.json({ data: history });
   } catch (error) {
-    res.status(401).json({
+    res.status(/登录|账号|token/i.test(error.message) ? 401 : 500).json({
       error: {
-        code: 'RETURN_LABEL_HANDOFF_FAILED',
+        code: 'RETURN_LABEL_HISTORY_LOAD_FAILED',
         message: error.message
       }
     });
   }
 });
 
-app.get('/api/return-label/open', (req, res) => {
-  const target = new URL(RETURN_LABEL_APP_URL);
-  if (req.query.handoff) target.searchParams.set('handoff', String(req.query.handoff));
-  res.redirect(302, target.toString());
-});
-
-app.post('/api/return-label/exchange', async (req, res) => {
+app.post('/api/return-label/history', async (req, res) => {
   try {
-    await initReturnLabelHandoffTable(getPool());
-    const handoffCode = String(req.body?.handoffCode || req.body?.handoff || '').trim();
-    if (!handoffCode) {
-      throw new Error('缺少一次性跳转凭证');
-    }
-    const handoffHashValue = handoffHash(handoffCode);
-    const [rows] = await getPool().execute(
-      `SELECT operator_key, operator_name, expires_at, consumed_at
-       FROM dashboard_return_label_handoffs
-       WHERE handoff_hash = ?
-       LIMIT 1`,
-      [handoffHashValue]
-    );
-    if (!rows.length) throw new Error('一次性跳转凭证无效，请重新打开入口');
-    const row = rows[0];
-    if (row.consumed_at) throw new Error('一次性跳转凭证已使用，请重新打开入口');
-    if (new Date(row.expires_at).getTime() < Date.now()) throw new Error('一次性跳转凭证已过期，请重新打开入口');
-    await getPool().execute(
-      'UPDATE dashboard_return_label_handoffs SET consumed_at = CURRENT_TIMESTAMP(3) WHERE handoff_hash = ? AND consumed_at IS NULL',
-      [handoffHashValue]
-    );
-    res.json({
-      data: {
-        operatorKey: row.operator_key,
-        operatorName: row.operator_name
-      }
+    const result = await appendReturnLabelHistory({
+      body: req.body,
+      operator: operatorFromBody(req.body)
     });
+    res.json({ data: result });
   } catch (error) {
-    res.status(400).json({
+    res.status(/登录|账号|token/i.test(error.message) ? 401 : 400).json({
       error: {
-        code: 'RETURN_LABEL_EXCHANGE_FAILED',
+        code: 'RETURN_LABEL_HISTORY_APPEND_FAILED',
         message: error.message
       }
     });

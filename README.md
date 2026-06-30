@@ -1,12 +1,12 @@
 # TEMU 运营看板
 
-本仓库提供长期打开的 TEMU 运营看板，给运营分开查看价格同步和库存上下架提醒。
+本模块提供长期打开的本地网页，给运营分开查看价格同步和库存上下架提醒。
 
 地址：
 
-- 价格页：`http://服务器IP:3106/price`
-- 库存页：`http://服务器IP:3106/inventory`
-- 根路径默认进入价格页：`http://服务器IP:3106`
+- 价格页：`http://127.0.0.1:3106/price`
+- 库存页：`http://127.0.0.1:3106/inventory`
+- 根路径默认进入价格页：`http://127.0.0.1:3106`
 
 ## 数据来源
 
@@ -15,22 +15,22 @@
 - 本地调试可设置 `DATA_SOURCE=file`，临时回到文件读取模式。
 
 仓库库存来自数仓只读查询。领星定时抓取每 4 小时执行一次，会先更新价格页数据，再更新库存页全状态数据，最后同步刷新库存文件。
-刷新完成后会由本机采集端导入 MySQL 最新看板快照。服务器只运行 Web 看板和 MySQL，不执行领星爬虫。
+刷新完成后会执行 `modules\temu-price-dashboard\scripts\import_dashboard_snapshot.js`，覆盖 MySQL 中的最新看板快照。服务器只读这些快照，不执行爬虫、不写数据库。
 
 ## 运行
 
-```bash
-cp .env.server.example .env
-docker compose -f docker-compose.server.yml --env-file .env up -d --build
-```
-
-本地调试可用：
-
 ```powershell
+cd "C:\Users\Administrator\Desktop\project\6\前后端价格显示及预警功能\modules\temu-price-dashboard"
 npm install
 npm run init:db
 npm run import:db
 npm start
+```
+
+设置登录后自动启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -NoProfile -File .\scripts\setup_dashboard_task.ps1
 ```
 
 ## 价格页

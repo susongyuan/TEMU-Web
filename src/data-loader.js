@@ -4,6 +4,7 @@ const XLSX = require('xlsx');
 
 const MODULE_DIR = path.resolve(__dirname, '..');
 const APP_DIR = path.resolve(MODULE_DIR, '..', '..');
+const PROJECT_DIR = path.resolve(APP_DIR, '..');
 const INPUT_DIR = path.join(APP_DIR, 'input', '在售');
 const DATA_DIR = path.join(MODULE_DIR, 'data');
 const WAREHOUSE_DATA_DIR = path.join(APP_DIR, 'modules', 'warehouse-inventory-monitor', 'data');
@@ -55,6 +56,8 @@ function newest(files) {
 
 function findSkuOwnerFiles() {
   const dirs = [
+    PROJECT_DIR,
+    path.join(PROJECT_DIR, 'return-label-automation'),
     path.join(APP_DIR, 'input'),
     INPUT_DIR
   ];
@@ -581,13 +584,7 @@ function skuOwnerFile() {
   return newest(findSkuOwnerFiles());
 }
 
-function loadSkuOwnerIndex() {
-  const file = skuOwnerFile();
-  const mtimeMs = file && fs.existsSync(file) ? fs.statSync(file).mtimeMs : 0;
-  if (skuOwnerCache && skuOwnerCache.file === file && skuOwnerCache.mtimeMs === mtimeMs) {
-    return skuOwnerCache.index;
-  }
-
+function buildSkuOwnerIndexFromFile(file) {
   const index = new Map();
   const exactOwners = new Map();
   const storeSkuOwners = new Map();
@@ -676,6 +673,17 @@ function loadSkuOwnerIndex() {
     for (const gram of new Set(ngrams(entry.key))) addToArrayMap(index.fuzzyByGram, gram, entry);
   }
   index.ownerMatchCache = new Map();
+  return index;
+}
+
+function loadSkuOwnerIndex() {
+  const file = skuOwnerFile();
+  const mtimeMs = file && fs.existsSync(file) ? fs.statSync(file).mtimeMs : 0;
+  if (skuOwnerCache && skuOwnerCache.file === file && skuOwnerCache.mtimeMs === mtimeMs) {
+    return skuOwnerCache.index;
+  }
+
+  const index = buildSkuOwnerIndexFromFile(file);
   skuOwnerCache = { file, mtimeMs, index };
   return index;
 }
@@ -1269,10 +1277,14 @@ module.exports = {
   INPUT_DIR,
   DATA_DIR,
   MODULE_DIR,
+  buildSkuOwnerIndexFromFile,
+  fileInfo,
   loadDashboardData,
   loadInventoryData,
   loadPriceData,
   normalizeKey,
   normalizeText,
+  ownerMatchForSkuValues,
+  skuOwnerFile,
   csvParse
 };

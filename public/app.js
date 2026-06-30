@@ -34,7 +34,8 @@ const OPERATION_ACTION_LABELS = {
   status_update: '处理状态变更',
   note_create: '新增备注',
   note_update: '编辑备注',
-  note_delete: '删除备注'
+  note_delete: '删除备注',
+  sku_owner_mapping_upload: '上传SKU-运营表'
 };
 const MANUAL_STATUSES = ['未处理', '已完成', '弃用'];
 
@@ -52,6 +53,8 @@ const els = {
   runInventoryBtn: document.getElementById('runInventoryBtn'),
   operatorBtn: document.getElementById('operatorBtn'),
   operationLogBtn: document.getElementById('operationLogBtn'),
+  uploadOwnerMappingBtn: document.getElementById('uploadOwnerMappingBtn'),
+  ownerMappingFileInput: document.getElementById('ownerMappingFileInput'),
   exportBtn: document.getElementById('exportBtn'),
   clearFiltersBtn: document.getElementById('clearFiltersBtn'),
   selectionCount: document.getElementById('selectionCount'),
@@ -62,8 +65,7 @@ const els = {
   clearSelectionBtn: document.getElementById('clearSelectionBtn'),
   resultCount: document.getElementById('resultCount'),
   priceNav: document.getElementById('priceNav'),
-  inventoryNav: document.getElementById('inventoryNav'),
-  returnLabelNav: document.getElementById('returnLabelNav')
+  inventoryNav: document.getElementById('inventoryNav')
 };
 
 const PAGE_CONFIG = {
@@ -392,7 +394,6 @@ function renderOperatorUi() {
   els.operatorBtn.textContent = name ? `操作人：${name}` : '设置操作人';
   els.operatorBtn.classList.toggle('is-empty', !name);
   els.operatorBtn.title = name ? '点击切换操作人' : '点击设置操作人后再处理备注和状态';
-  if (els.returnLabelNav) els.returnLabelNav.href = returnLabelOpenUrl();
 }
 
 function ensureAuthPanel() {
@@ -637,25 +638,6 @@ function operationLogParams() {
   if (text(els.actionType.value)) params.set('actionType', text(els.actionType.value));
   if (text(els.search.value)) params.set('keyword', text(els.search.value));
   return params;
-}
-
-function returnLabelOpenUrl() {
-  return '/api/return-label/open';
-}
-
-async function openReturnLabelService() {
-  const operator = await ensureOperator();
-  if (!operator) return;
-  const response = await fetch('/api/return-label/handoff', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(operatorPayload())
-  });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error?.message || '打开退货面单失败');
-  const openUrl = payload.data?.openUrl || '/api/return-label/open';
-  const popup = window.open(openUrl, '_blank', 'noopener,noreferrer');
-  if (!popup) window.location.href = openUrl;
 }
 
 async function loadOperationLogs() {
@@ -2077,8 +2059,8 @@ async function checkForRemoteUpdate() {
     const generatedAt = text(snapshot?.generated_at);
     if (!generatedAt || !state.snapshotGeneratedAt || generatedAt === state.snapshotGeneratedAt) return;
     await loadData({ silent: true, reason: 'auto-refresh' });
-  } catch {
-    // Keep the current page usable when the health check is temporarily unavailable.
+  } catch (error) {
+    console.warn('Auto refresh check failed:', error);
   }
 }
 
@@ -2107,6 +2089,55 @@ async function postRefresh(url, button, pendingText, normalText) {
       button.disabled = false;
       button.textContent = normalText;
     }, 3000);
+  }
+}
+
+function requestOwnerMappingUpload() {
+  if (!els.ownerMappingFileInput) return;
+  els.ownerMappingFileInput.value = '';
+  els.ownerMappingFileInput.click();
+}
+
+async function uploadOwnerMappingFile(file) {
+  const operator = await ensureOperator();
+  if (!operator || !file) return;
+  if (!/\.xlsx$/i.test(file.name)) {
+    alert('目前只支持上传 .xlsx 文件');
+    return;
+  }
+
+  const button = els.uploadOwnerMappingBtn;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '上传中';
+  }
+  try {
+    const response = await fetch('/api/sku-owner-mapping/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Authorization': `Bearer ${operator.authToken}`,
+        'X-Upload-Filename': encodeURIComponent(file.name)
+      },
+      body: file
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '上传失败');
+    const data = payload.data || {};
+    const snapshotText = (data.snapshots || [])
+      .map(item => item.skipped ? `${item.mode}跳过` : `${item.mode}:${item.rowCount || 0}行`)
+      .join('，');
+    alert(`SKU-运营映射已更新：${data.rowCount || 0}行${snapshotText ? `；快照 ${snapshotText}` : ''}`);
+    await loadHealth();
+    await loadData({ reason: 'owner-mapping-upload' });
+  } catch (error) {
+    await handleActionError(error);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '上传SKU-运营表';
+    }
+    if (els.ownerMappingFileInput) els.ownerMappingFileInput.value = '';
   }
 }
 
@@ -2160,15 +2191,11 @@ document.addEventListener('visibilitychange', () => {
 });
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel());
-els.returnLabelNav?.addEventListener('click', async event => {
-  event.preventDefault();
-  try {
-    await openReturnLabelService();
-  } catch (error) {
-    alert(error.message);
-  }
-});
 els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
+els.uploadOwnerMappingBtn?.addEventListener('click', requestOwnerMappingUpload);
+els.ownerMappingFileInput?.addEventListener('change', event => {
+  uploadOwnerMappingFile(event.target.files?.[0]).catch(error => alert(error.message));
+});
 els.refreshBtn.addEventListener('click', () => loadData().catch(error => alert(error.message)));
 els.runFetchBtn.addEventListener('click', () => postRefresh('/api/refresh/lingxing', els.runFetchBtn, '已提交同步更新', '同步更新领星+库存'));
 els.runInventoryBtn.addEventListener('click', () => postRefresh('/api/refresh/inventory', els.runInventoryBtn, '已提交库存刷新', '仅刷新库存'));

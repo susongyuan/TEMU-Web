@@ -184,6 +184,30 @@ async function runDashboardSchemaInit(db) {
   `);
 
   await db.query(`
+    CREATE TABLE IF NOT EXISTS return_label_history (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      external_id VARCHAR(128) NULL DEFAULT NULL,
+      order_no VARCHAR(128) NULL DEFAULT NULL,
+      tracking_no VARCHAR(128) NULL DEFAULT NULL,
+      platform VARCHAR(64) NULL DEFAULT NULL,
+      store_name VARCHAR(128) NULL DEFAULT NULL,
+      status VARCHAR(64) NOT NULL,
+      message TEXT NULL,
+      request_json JSON NULL,
+      response_json JSON NULL,
+      operator_key VARCHAR(64) NULL DEFAULT NULL,
+      operator_name VARCHAR(64) NULL DEFAULT NULL,
+      created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      KEY idx_return_label_history_created (created_at),
+      KEY idx_return_label_history_order_created (order_no, created_at),
+      KEY idx_return_label_history_tracking_created (tracking_no, created_at),
+      KEY idx_return_label_history_status_created (status, created_at),
+      KEY idx_return_label_history_external (external_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await db.query(`
     INSERT INTO dashboard_operators (operator_key, operator_name)
     VALUES ('legacy-shixiaofang', '石小芳')
     ON DUPLICATE KEY UPDATE operator_name = VALUES(operator_name)

@@ -1,0 +1,20 @@
+services:
+  temu-price-dashboard:
+    build: .
+    image: temu-price-dashboard:latest
+    container_name: temu-price-dashboard
+    restart: unless-stopped
+    ports:
+      - "3106:3106"
+    environment:
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 3106
+      DATA_SOURCE: db
+      ENABLE_LOCAL_REFRESH: "false"
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-temu_readonly}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-temu_monitor}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
