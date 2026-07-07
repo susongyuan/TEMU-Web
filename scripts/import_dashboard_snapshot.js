@@ -6,7 +6,8 @@ process.env.DASHBOARD_IMPORT_TRACE = process.env.DASHBOARD_IMPORT_TRACE || '1';
 
 function parseModes(argv) {
   const modeArgIndex = argv.findIndex(arg => arg === '--mode' || arg === '-m');
-  const value = modeArgIndex >= 0 ? argv[modeArgIndex + 1] : 'all';
+  const positionalMode = argv.find(arg => !String(arg || '').startsWith('-'));
+  const value = modeArgIndex >= 0 ? argv[modeArgIndex + 1] : positionalMode || 'all';
   if (value === 'price') return ['price'];
   if (value === 'inventory') return ['inventory'];
   if (value === 'all') return ['price', 'inventory'];
