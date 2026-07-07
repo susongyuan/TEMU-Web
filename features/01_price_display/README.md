@@ -32,18 +32,18 @@ price
 
 ## 当前数据口径
 
-- 领星价格数据：`input/在售/领星_TEMU_今日已加入站点_全店铺`
-- TEMU 前端数据：`modules/temu-price-dashboard/data/temu_official_products.csv|json`
+- TEMU 后台数据：只取后台导出中 `商品状态` 含 `在售` 的行。
+- TEMU 前端数据：`modules/temu-price-dashboard/data/temu_official_products.csv|json` 或前端上传后保存在数据库中，作为独立数据源和后台在售行匹配。
 - 负责人映射：最新的 `平台SKU_*.xlsx` 或 `SKU-运营映射表.xlsx`
+- 普通标题匹配默认阈值 45%，翻译标题匹配默认阈值 30%。
 
 价格提醒规则：
 
-- 有活动价时优先用活动价
-- 没有活动价时用申报价
+- 以后台申报价作为对比基准
 - TEMU 前端价超过后台对比价 20% 时标记 `前端超价20%`
-- 其他不一致标记 `价格不一致`
+- 其他价差标记 `正常价差`，仅作信息展示，默认 `无需处理`
+- 只有 `前端超价20%` 会进入 `未完成`，需要运营处理
 
 ## 后续完善时优先改这里
 
 如果只是完善“前后端价格显示”，优先改 `PAGE_CONFIG.price` 和 `loadPriceData()` 相关逻辑，不要改库存上下架规则。
-

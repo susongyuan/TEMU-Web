@@ -1,6 +1,8 @@
 const { closePool, redactedDbConfig } = require('../src/db');
-const { loadInventoryData, loadPriceData } = require('../src/data-loader');
+const { loadInventoryData, loadPriceDataAsync } = require('../src/data-loader');
 const { saveDashboardSnapshot } = require('../src/snapshot-store');
+
+process.env.DASHBOARD_IMPORT_TRACE = process.env.DASHBOARD_IMPORT_TRACE || '1';
 
 function parseModes(argv) {
   const modeArgIndex = argv.findIndex(arg => arg === '--mode' || arg === '-m');
@@ -11,8 +13,8 @@ function parseModes(argv) {
   throw new Error(`Unsupported mode: ${value}`);
 }
 
-function loadDataForMode(mode) {
-  return mode === 'inventory' ? loadInventoryData() : loadPriceData();
+async function loadDataForMode(mode) {
+  return mode === 'inventory' ? loadInventoryData() : loadPriceDataAsync();
 }
 
 async function main() {
@@ -20,7 +22,7 @@ async function main() {
   console.log('Import dashboard snapshots to MySQL:', redactedDbConfig());
 
   for (const mode of modes) {
-    const data = loadDataForMode(mode);
+    const data = await loadDataForMode(mode);
     const result = await saveDashboardSnapshot(data);
     console.log(`[OK] ${mode}: snapshot=${result.snapshotId}, rows=${result.rowCount}, generated_at=${result.generatedAt}`);
   }

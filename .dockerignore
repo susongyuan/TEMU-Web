@@ -7,6 +7,8 @@ logs/
 node_modules/
 scripts/*
 !scripts/init_db.js
+!scripts/import_dashboard_snapshot.js
+!scripts/import_dashboard_snapshot_file.js
 !scripts/provision_dashboard_operators.js
 !scripts/backfill_action_authors_from_owner.js
 tools/

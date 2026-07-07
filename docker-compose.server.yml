@@ -44,8 +44,37 @@ services:
       DB_USER: ${DB_USER:-temu_app}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: ${DB_NAME:-temu_monitor}
+      RETURN_LABEL_APP_URL: ${RETURN_LABEL_APP_URL:-}
+      RETURN_LABEL_APP_PORT: ${RETURN_LABEL_APP_PORT:-3206}
       TEMU_OFFICIAL_UPLOAD_TOKEN: ${TEMU_OFFICIAL_UPLOAD_TOKEN:-}
       TEMU_OFFICIAL_UPLOAD_LIMIT: ${TEMU_OFFICIAL_UPLOAD_LIMIT:-20mb}
+      PRICE_TITLE_TRANSLATION_PROVIDER: ${PRICE_TITLE_TRANSLATION_PROVIDER:-libretranslate}
+      PRICE_TITLE_TRANSLATION_LOCAL_FIRST: ${PRICE_TITLE_TRANSLATION_LOCAL_FIRST:-true}
+      LIBRETRANSLATE_URL: ${LIBRETRANSLATE_URL:-http://libretranslate:5000}
+      PRICE_TITLE_TRANSLATION_BATCH_SIZE: ${PRICE_TITLE_TRANSLATION_BATCH_SIZE:-10}
+      TRANSLATION_FETCH_TIMEOUT_MS: ${TRANSLATION_FETCH_TIMEOUT_MS:-30000}
+    volumes:
+      - temu_dashboard_data:/app/data
+
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    container_name: temu-libretranslate
+    restart: unless-stopped
+    environment:
+      LT_HOST: 0.0.0.0
+      LT_PORT: 5000
+      LT_LOAD_ONLY: ${LT_LOAD_ONLY:-en,de,zh,fr,es,it}
+      LT_UPDATE_MODELS: ${LT_UPDATE_MODELS:-true}
+    volumes:
+      - temu_libretranslate_data:/home/libretranslate/.local
+    healthcheck:
+      test: ["CMD-SHELL", "./venv/bin/python scripts/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
 
 volumes:
   temu_mysql_data:
+  temu_libretranslate_data:
+  temu_dashboard_data:

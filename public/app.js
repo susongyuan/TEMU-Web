@@ -38,9 +38,10 @@ const OPERATION_ACTION_LABELS = {
   sku_owner_mapping_upload: '上传SKU-运营表',
   temu_official_products_upload: '上传TEMU前端价格'
 };
-const MANUAL_STATUSES = ['未处理', '已完成', '弃用'];
+const MANUAL_STATUSES = ['未完成', '已完成', '已下架'];
 
 const els = {
+  topbar: document.querySelector('.topbar'),
   title: document.getElementById('pageTitle'),
   sourceLine: document.getElementById('sourceLine'),
   updateStatus: document.getElementById('updateStatus'),
@@ -56,6 +57,8 @@ const els = {
   operationLogBtn: document.getElementById('operationLogBtn'),
   uploadOfficialProductsBtn: document.getElementById('uploadOfficialProductsBtn'),
   officialProductsFileInput: document.getElementById('officialProductsFileInput'),
+  uploadBackendProductsBtn: document.getElementById('uploadBackendProductsBtn'),
+  backendProductsFileInput: document.getElementById('backendProductsFileInput'),
   uploadOwnerMappingBtn: document.getElementById('uploadOwnerMappingBtn'),
   ownerMappingFileInput: document.getElementById('ownerMappingFileInput'),
   exportBtn: document.getElementById('exportBtn'),
@@ -71,6 +74,11 @@ const els = {
   inventoryNav: document.getElementById('inventoryNav')
 };
 
+function updateStickyControlOffset() {
+  const height = Math.ceil(els.topbar?.getBoundingClientRect().height || 0);
+  document.documentElement.style.setProperty('--sticky-controls-top', `${height + 8}px`);
+}
+
 const PAGE_CONFIG = {
   price: {
     title: '前后端价格同步',
@@ -78,48 +86,59 @@ const PAGE_CONFIG = {
     exportName: 'TEMU前后端价格同步',
     sourceLine(payload) {
       const meta = payload.meta || {};
-      return `领星：${sourceText(payload.sources?.lingxing_price)}；TEMU官方：${sourceText(payload.sources?.temu_official)}；` +
+      return `后台：${sourceText(payload.sources?.temu_backend)}；TEMU前端：${sourceText(payload.sources?.temu_official)}；` +
         `合并行：${meta.merged_rows || 0}；超价20%：${meta.price_alert_rows || 0}；页面刷新：${formatDateTime(payload.generated_at)}`;
     },
     metrics: [
-      ['lingxing_rows', '领星行数'],
-      ['temu_official_rows', '官方行数'],
+      ['temu_backend_price_rows', '后台在售行'],
+      ['temu_official_rows', '前端行数'],
       ['matched_rows', '已匹配'],
-      ['price_diff_rows', '价格差异', 'danger'],
-      ['price_alert_rows', '超价20%', 'danger']
+      ['unmatched_backend_rows', '后台未匹配'],
+      ['unmatched_frontend_rows', '前端未匹配'],
+      ['price_diff_rows', '有价差'],
+      ['price_alert_rows', '超价20%', 'danger'],
+      ['manual_pending_rows', '未完成', 'warn'],
+      ['manual_done_rows', '已完成'],
+      ['manual_abandoned_rows', '已下架']
     ],
     filters: [
       { id: 'storeRegion', label: '店铺/区域', kind: 'field' },
       { id: 'owner', label: '负责人', kind: 'splitField' },
       { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '多负责人候选', '未匹配负责人'] },
-      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
+      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', '店铺SKU前缀', '区域SKU前缀', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
       { id: 'storeName', label: '店铺', kind: 'field' },
       { id: 'area', label: '区域', kind: 'field' },
       { id: 'site', label: '站点', kind: 'field' },
-      { id: 'matchStatus', label: '匹配状态', kind: 'fixed', options: ['领星未匹配官方', '官方未匹配领星', '标题匹配', 'SKU匹配'] },
-      { id: 'priceAlert', label: '价格提醒', kind: 'fixed', options: ['前端超价20%', '价格不一致', '价格一致', '前端缺价', '后台缺价', '官方未匹配领星'] },
-      { id: 'referencePriceType', label: '对比价类型', kind: 'fixed', options: ['活动价', '申报价'] },
+      { id: 'officialSite', label: '前端站点', kind: 'splitField' },
+      { id: 'matchStatus', label: '匹配状态', kind: 'fixed', options: ['后台未匹配前端', '前端未匹配后台', '图片匹配', '标题匹配', '标题模糊匹配', '翻译标题匹配', '店铺标题弱匹配'] },
+      { id: 'priceAlert', label: '价格提醒', kind: 'fixed', options: ['前端超价20%', '正常价差', '前端缺价', '后台缺价', '前端未匹配后台'] },
+      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未完成', '已完成', '已下架', '无需处理'] },
+      { id: 'referencePriceType', label: '对比价类型', kind: 'fixed', options: ['申报价'] },
       { id: 'priceOver20', label: '超价20%', kind: 'fixed', options: ['是', '否'] }
     ],
     columns: [
-      ['image', '图片', imageCell],
-      ['priceAlert', '价格提醒', priceAlertCell],
-      ['priceOver20', '超20%', yesNoCell],
-      ['sourceSide', '来源', sourceCell],
+      ['officialImage', '前端图片', officialImageCell],
+      ['storeRegion', '店铺/区域', inventoryStoreRegionCell],
       ['platformSpu', '平台SPU'],
       ['skuCode', 'SKU货号'],
       ['skuName', '品名/SKU'],
       ['owner', '负责人', ownerCell],
-      ['ownerStatus', '负责人状态', ownerStatusCell],
-      ['ownerMatchText', '匹配方式', ownerMatchCell],
-      ['storeRegion', '店铺/区域'],
-      ['site', '站点'],
-      ['title', '标题', titleCell],
-      ['referencePrice', '后台对比价', referencePriceCell],
+      ['priceAlert', '价格提醒', priceAlertCell],
+      ['manualProcessStatus', '处理状态', manualProcessStatusCell],
+      ['priceOver20', '超20%', yesNoCell],
+      ['referencePrice', '申报价', referencePriceCell],
       ['officialPrice', 'TEMU前端价', officialPriceCell],
+      ['officialSite', '前端站点', compactSiteCell],
+      ['officialComparablePrice', '前端USD价', officialComparablePriceCell],
       ['priceDiff', '差异'],
       ['priceDiffRate', '差异%'],
+      ['manualRemark', '备注', manualRemarkCell],
+      ['sourceSide', '来源', sourceCell],
+      ['title', '标题', titleCell],
       ['matchStatus', '匹配', matchCell],
+      ['ownerStatus', '负责人状态', ownerStatusCell],
+      ['ownerMatchText', '匹配方式', ownerMatchCell],
+      ['site', '站点'],
       ['lingxingDeclarePrice', '申报价'],
       ['lingxingActivityPrice', '活动价'],
       ['mallId', '店铺ID'],
@@ -143,19 +162,35 @@ const PAGE_CONFIG = {
       ['ownerMatchScore', '匹配分数'],
       ['storeName', '店铺'],
       ['area', '区域'],
-      ['site', '站点'],
-      ['title', '领星标题'],
+      ['site', '站点', compactSiteCell],
+      ['backendProductStatus', '后台商品状态'],
+      ['backendPriceSite', '后台申报价站点'],
+      ['backendDeclarePriceStatus', '后台申报价状态'],
+      ['officialSite', '前端站点'],
+      ['title', '后台标题'],
+      ['backendMachineTranslatedTitle', '后台翻译标题'],
       ['officialTitle', 'TEMU标题'],
+      ['officialMachineTranslatedTitle', 'TEMU翻译标题'],
       ['referencePriceType', '对比价类型'],
-      ['referencePrice', '后台对比价'],
+      ['referencePrice', '申报价'],
+      ['vatRate', 'VAT税率'],
       ['referenceCurrency', '后台币种'],
       ['officialPrice', 'TEMU前端价'],
       ['officialCurrency', 'TEMU币种'],
+      ['officialComparablePrice', '前端USD价'],
+      ['officialComparableCurrency', '换算币种'],
+      ['currencyConversionRate', '换算汇率'],
+      ['currencyWarning', '币种提醒'],
       ['priceDiff', '价格差异'],
       ['priceDiffRate', '差异%'],
       ['matchStatus', '匹配状态'],
       ['officialUrl', 'TEMU链接'],
-      ['image', '图片']
+      ['officialImage', '前端图片'],
+      ['manualProcessStatus', '处理状态'],
+      ['manualActionOperator', '处理人'],
+      ['manualActionUpdatedAt', '处理时间'],
+      ['manualRemarkAuthors', '备注人'],
+      ['manualRemark', '处理备注']
     ]
   },
   inventory: {
@@ -164,33 +199,36 @@ const PAGE_CONFIG = {
     exportName: 'TEMU库存上下架提醒',
     sourceLine(payload) {
       const meta = payload.meta || {};
-      return `库存文件：${sourceText(payload.sources?.warehouse_inventory)}；领星全状态：${sourceText(payload.sources?.lingxing_inventory)}；` +
+      return `库存文件：${sourceText(payload.sources?.warehouse_inventory)}；领星全状态：${sourceText(payload.sources?.lingxing_inventory)}；后台：${sourceText(payload.sources?.temu_backend)}；` +
         `库存核对行：${meta.inventory_rows || 0}；强提醒：${meta.inventory_alert_rows || 0}；需处理：${meta.action_required_rows || 0}；页面刷新：${formatDateTime(payload.generated_at)}`;
     },
     metrics: [
       ['inventory_rows', '库存核对行'],
+      ['temu_backend_rows', '后台全量行'],
+      ['temu_backend_added_rows', '后台新增'],
       ['inventory_alert_rows', '强提醒', 'danger'],
       ['action_required_rows', '需处理', 'warn'],
-      ['manual_pending_rows', '未处理', 'warn'],
+      ['manual_pending_rows', '未完成', 'warn'],
       ['manual_done_rows', '已完成'],
-      ['manual_abandoned_rows', '弃用'],
+      ['manual_abandoned_rows', '已下架'],
       ['active_listing_no_available_stock_rows', '在卖无可用库存', 'danger'],
       ['no_active_listing_with_stock_rows', '有库存无在卖', 'warn'],
-      ['other_region_stock_rows', '其他区域有库存']
+      ['other_region_stock_rows', '其他区域有库存'],
+      ['unknown_region_stock_rows', '仓库地区待确认']
     ],
     filters: [
       { id: 'storeRegion', label: '店铺/区域', kind: 'field' },
       { id: 'owner', label: '负责人', kind: 'splitField' },
       { id: 'ownerStatus', label: '负责人状态', kind: 'fixed', options: ['已匹配负责人', '多负责人候选', '未匹配负责人'] },
-      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
+      { id: 'ownerMatchType', label: '负责人匹配', kind: 'fixed', options: ['店铺SKU', '区域SKU', '精确SKU', '店铺SKU前缀', '区域SKU前缀', 'SKU前缀', '产品名', '模糊产品名', '未匹配'] },
       { id: 'storeName', label: '店铺', kind: 'field' },
       { id: 'area', label: '区域', kind: 'field' },
       { id: 'site', label: '站点', kind: 'field' },
       { id: 'regionGroup', label: '区域组', kind: 'fixed', options: ['美国/Global', '欧区'] },
       { id: 'status', label: '领星状态', kind: 'field' },
-      { id: 'stockAction', label: '处理动作', kind: 'fixed', options: ['有在卖但没可用库存', '有库存但无在卖链接', '库存源异常', '正常'] },
-      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未处理', '已完成', '弃用', '无需处理'] },
-      { id: 'warehouseRegionMatchStatus', label: '仓库地区', kind: 'fixed', options: ['同区匹配', '其他区域有库存', '无库存记录'] },
+      { id: 'stockAction', label: '处理动作', kind: 'fixed', options: ['有在卖但没可用库存', '有库存但无在卖链接', '仓库地区待确认', '库存源异常', '正常'] },
+      { id: 'manualProcessStatus', label: '处理状态', kind: 'fixed', options: ['未完成', '已完成', '已下架', '无需处理'] },
+      { id: 'warehouseRegionMatchStatus', label: '仓库地区', kind: 'fixed', options: ['同区匹配', '仓库地区待确认', '其他区域有库存', '无库存记录'] },
       { id: 'warehouseSource', label: '仓库来源', kind: 'splitField' }
     ],
     columns: [
@@ -239,6 +277,9 @@ const PAGE_CONFIG = {
       ['ownerStatus', '负责人状态'],
       ['ownerMatchType', '负责人匹配'],
       ['ownerMatchScore', '匹配分数'],
+      ['backendProductStatus', '后台商品状态'],
+      ['backendPriceSite', '后台申报价站点'],
+      ['backendDeclarePriceStatus', '后台申报价状态'],
       ['title', '标题'],
       ['image', '图片'],
       ['stockAction', '处理动作'],
@@ -313,6 +354,7 @@ function searchTextForRow(row) {
     'storeRegion',
     'area',
     'site',
+    'officialSite',
     'regionGroup',
     'mallId',
     'goodsId',
@@ -776,12 +818,13 @@ function updateSourceItems(payload) {
     return [
       { label: '库存核对生成', source: payload.sources?.warehouse_inventory, checkFreshness: true },
       { label: '领星全状态', source: payload.sources?.lingxing_inventory, checkFreshness: true },
+      { label: 'TEMU后台导出', source: payload.sources?.temu_backend, checkFreshness: true },
       { label: '页面读取', updatedAt: payload.generated_at, checkFreshness: false }
     ];
   }
   return [
-    { label: '领星价格数据', source: payload.sources?.lingxing_price, checkFreshness: true },
-    { label: 'TEMU官方数据', source: payload.sources?.temu_official, checkFreshness: false },
+    { label: 'TEMU后台导出', source: payload.sources?.temu_backend, checkFreshness: true },
+    { label: 'TEMU前端数据', source: payload.sources?.temu_official, checkFreshness: false },
     { label: '页面读取', updatedAt: payload.generated_at, checkFreshness: false }
   ];
 }
@@ -854,7 +897,7 @@ function renderUpdateStatus(payload) {
 }
 
 function splitValues(value) {
-  return text(value).split(/[；;,，\n\r]+/).map(item => item.trim()).filter(Boolean);
+  return text(value).split(/[；;,，\/\n\r]+/).map(item => item.trim()).filter(Boolean);
 }
 
 function normalizeOption(option) {
@@ -964,6 +1007,7 @@ function renderPageChrome() {
   els.priceNav.classList.toggle('active', PAGE === 'price');
   els.inventoryNav.classList.toggle('active', PAGE === 'inventory');
   if (els.uploadOfficialProductsBtn) els.uploadOfficialProductsBtn.hidden = PAGE !== 'price';
+  if (els.uploadBackendProductsBtn) els.uploadBackendProductsBtn.hidden = PAGE !== 'price';
   renderTableHead();
 }
 
@@ -991,14 +1035,13 @@ function columnClass(key) {
 }
 
 function rowClass(row) {
-  if (row.manualProcessStatus === '弃用') return 'row-abandoned';
+  if (row.manualProcessStatus === '已下架') return 'row-abandoned';
   if (PAGE === 'inventory') {
     if (row.stockAction === '有在卖但没可用库存') return 'row-danger';
     if (row.stockAction === '有库存但无在卖链接' || row.stockAction === '库存源异常') return 'row-warn';
     return '';
   }
   if (row.priceAlert === '前端超价20%') return 'row-danger';
-  if (row.priceAlert === '价格不一致') return 'row-warn';
   return '';
 }
 
@@ -1173,17 +1216,66 @@ function handleTableInput(event) {
   }
 }
 
-function imageCell(row) {
-  return row.image
-    ? `<img class="product-img" src="${escapeHtml(row.image)}" loading="lazy" referrerpolicy="no-referrer" alt="">`
+function imageDisplaySrc(value) {
+  const source = text(value);
+  if (!source) return '';
+  if (/^https?:\/\//i.test(source) || /^\/\//.test(source)) {
+    return `/api/image-proxy?url=${encodeURIComponent(source)}`;
+  }
+  return source;
+}
+
+function imageValueCell(value) {
+  const src = imageDisplaySrc(value);
+  return src
+    ? `<img class="product-img" src="${escapeHtml(src)}" loading="lazy" referrerpolicy="no-referrer" alt="">`
     : '<div class="product-img"></div>';
 }
 
+function imageCell(row) {
+  const fallback = row.officialImage && row.image === row.officialImage ? '' : row.image;
+  return imageValueCell(row.lingxingImage || fallback);
+}
+
+function officialImageCell(row) {
+  return imageValueCell(row.officialImage || (row.sourceSide === 'TEMU官方' ? row.image : ''));
+}
+
+function imageSimilarityCell(row) {
+  const score = Number(row.imageSimilarity);
+  if (!Number.isFinite(score) || score <= 0) return '';
+  return pill(`${Math.round(score)}%`, score >= 90 ? '' : 'warn');
+}
+
+function titleLine(label, value, type = '') {
+  const cleanValue = text(value);
+  if (!cleanValue) return '';
+  return `<div class="title-line ${type}">${label ? `<span>${escapeHtml(label)}</span>` : ''}${escapeHtml(cleanValue)}</div>`;
+}
+
 function titleCell(row) {
-  if (row.title && row.officialTitle && row.title !== row.officialTitle) {
-    return `<div class="title-cell">${escapeHtml(row.title)}<div class="muted">TEMU：${escapeHtml(row.officialTitle)}</div></div>`;
+  const backendTitle = text(row.title);
+  const backendTranslated = text(row.backendMachineTranslatedTitle || row.backendEnglishTitle || '');
+  const officialTitle = text(row.officialTitle);
+  const officialTranslated = text(row.officialMachineTranslatedTitle || '');
+  const lines = [];
+
+  if (backendTitle) lines.push(titleLine('', backendTitle, 'is-main'));
+  if (backendTranslated && compactSearchText(backendTranslated) !== compactSearchText(backendTitle)) {
+    lines.push(titleLine('后台译：', backendTranslated, 'is-translated'));
   }
-  return `<div class="title-cell">${escapeHtml(row.title || row.officialTitle)}</div>`;
+  if (officialTitle && compactSearchText(officialTitle) !== compactSearchText(backendTitle)) {
+    lines.push(titleLine('TEMU：', officialTitle, 'is-official'));
+  }
+  if (
+    officialTranslated &&
+    compactSearchText(officialTranslated) !== compactSearchText(officialTitle) &&
+    compactSearchText(officialTranslated) !== compactSearchText(backendTranslated)
+  ) {
+    lines.push(titleLine('TEMU译：', officialTranslated, 'is-translated'));
+  }
+
+  return `<div class="title-cell">${lines.join('') || escapeHtml(backendTitle || officialTitle)}</div>`;
 }
 
 function multilineCell(row, key) {
@@ -1193,6 +1285,45 @@ function multilineCell(row, key) {
 function defaultCell(row, key) {
   if (key === 'owner' && !text(row[key])) return pill(EMPTY_OWNER_LABEL, 'muted-pill');
   return `<div class="plain-cell">${escapeHtml(row[key])}</div>`;
+}
+
+function compactListValues(value, limit = 4) {
+  const values = text(value)
+    .split(/[；;,，\/\n]+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+  const unique = [];
+  const seen = new Set();
+  for (const item of values) {
+    const key = item.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
+  return {
+    all: unique,
+    short: unique.length > limit
+      ? `${unique.slice(0, limit).join(' / ')} / 等${unique.length}项`
+      : unique.join(' / ')
+  };
+}
+
+function compactSiteCell(row, key) {
+  const values = compactListValues(row.backendMergedSites || row[key]);
+  if (!values.all.length) return '';
+  return `<div class="plain-cell compact-site-cell" title="${escapeHtml(values.all.join(' / '))}">${escapeHtml(values.short)}</div>`;
+}
+
+function inventoryStoreRegionCell(row) {
+  const store = text(row.storeName) || text(row.storeRegion).split(/\s+\/\s+/)[0];
+  const values = compactListValues(row.backendMergedSites || row.site || row.area);
+  const display = values.short
+    ? `${store || '空店铺'} / ${values.short}`
+    : text(row.storeRegion);
+  const full = values.all.length
+    ? `${store || '空店铺'} / ${values.all.join(' / ')}`
+    : display;
+  return `<div class="plain-cell compact-site-cell" title="${escapeHtml(full)}">${escapeHtml(display)}</div>`;
 }
 
 function ownerCell(row) {
@@ -1291,12 +1422,16 @@ function statusSummaryCell(row, key) {
     .split(/[；;,，\n]+/)
     .map(cleanStatusText)
     .filter(Boolean);
-  const notes = manualNotesForRow(row);
-  const latestNotes = notes.slice(0, 2);
   const statusHtml = values.length
     ? `<div class="status-list-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`
     : '';
-  const noteHtml = row._rowKey ? `
+  return `<div class="status-with-note">${statusHtml}${noteControlHtml(row)}</div>`;
+}
+
+function noteControlHtml(row) {
+  const notes = manualNotesForRow(row);
+  const latestNotes = notes.slice(0, 2);
+  return row._rowKey ? `
     <div class="row-note ${notes.length ? 'has-note' : ''}">
       ${latestNotes.length ? `
         <div class="row-note-list">
@@ -1319,7 +1454,10 @@ function statusSummaryCell(row, key) {
       >${notes.length ? `备注 ${notes.length}` : '备注'}</button>
     </div>
   ` : '';
-  return `<div class="status-with-note">${statusHtml}${noteHtml}</div>`;
+}
+
+function manualRemarkCell(row) {
+  return `<div class="status-with-note">${noteControlHtml(row)}</div>`;
 }
 
 function pill(textValue, type = '') {
@@ -1328,12 +1466,12 @@ function pill(textValue, type = '') {
 }
 
 function sourceCell(row) {
-  return row.sourceSide === 'TEMU官方' ? pill('TEMU官方', 'official') : pill(row.sourceSide || '领星');
+  return row.sourceSide === 'TEMU官方' ? pill('TEMU前端', 'official') : pill(row.sourceSide || 'TEMU后台');
 }
 
 function matchCell(row) {
-  if (row.matchStatus === '领星未匹配官方' || row.matchStatus === '官方未匹配领星') return pill(row.matchStatus, 'danger');
-  if (row.matchStatus === '标题匹配') return pill(row.matchStatus, 'warn');
+  if (row.matchStatus === '后台未匹配前端' || row.matchStatus === '前端未匹配后台' || row.matchStatus === '领星未匹配官方' || row.matchStatus === '官方未匹配领星') return pill(row.matchStatus, 'danger');
+  if (row.matchStatus === '标题匹配' || row.matchStatus === '标题模糊匹配' || row.matchStatus === '翻译标题匹配' || row.matchStatus === '店铺标题弱匹配') return pill(row.matchStatus, 'warn');
   return pill(row.matchStatus);
 }
 
@@ -1363,8 +1501,7 @@ function yesNoCell(row, key) {
 
 function priceAlertCell(row) {
   if (row.priceAlert === '前端超价20%') return pill(row.priceAlert, 'danger');
-  if (row.priceAlert === '价格不一致') return pill(row.priceAlert, 'warn');
-  if (row.priceAlert === '价格一致') return pill(row.priceAlert);
+  if (row.priceAlert === '正常价差') return pill(row.priceAlert);
   return pill(row.priceAlert, 'muted-pill');
 }
 
@@ -1372,6 +1509,7 @@ function stockActionCell(row) {
   if (row.stockAction === '有在卖但没可用库存') return pill(row.stockAction, 'danger');
   if (row.stockAction === '有库存但无在卖链接' || row.stockAction === '公司有库存但TEMU无在卖') return pill(row.stockAction, 'warn');
   if (row.stockAction === '库存源异常') return pill(row.stockAction, 'muted-pill');
+  if (row.stockAction === '仓库地区待确认') return pill(row.stockAction, 'muted-pill');
   return pill(row.stockAction);
 }
 
@@ -1379,7 +1517,7 @@ function manualProcessStatusCell(row) {
   const status = text(row.manualProcessStatus || '无需处理');
   if (status === '无需处理' || row.manualActionable !== '是') return pill('无需处理', 'muted-pill');
   const operator = text(row.manualActionOperator);
-  const tone = status === '弃用' ? 'is-abandoned' : status === '已完成' ? 'is-done' : 'is-pending';
+  const tone = status === '已下架' ? 'is-abandoned' : status === '已完成' ? 'is-done' : 'is-pending';
   return `
     <div class="manual-status-cell">
       <select
@@ -1400,8 +1538,20 @@ function referencePriceCell(row) {
 }
 
 function officialPriceCell(row) {
+  const values = text(row.officialPrice)
+    .split(/\n+/)
+    .map(item => item.trim())
+    .filter(Boolean);
+  if (values.length > 1) {
+    return `<div class="price-details-cell">${values.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>`;
+  }
   const value = escapeHtml(row.officialPrice);
   return row.officialUrl ? `<a href="${escapeHtml(row.officialUrl)}" target="_blank" rel="noreferrer">${value}</a>` : value;
+}
+
+function officialComparablePriceCell(row) {
+  if (!text(row.officialComparablePrice)) return '';
+  return `${escapeHtml(row.officialComparablePrice)} <span class="muted">${escapeHtml(row.officialComparableCurrency)}</span>`;
 }
 
 function closeFilterMenus(except) {
@@ -1520,7 +1670,7 @@ function updateRowsManualStatus(rowKey, status, updatedAt, operatorName = '') {
     row.manualProcessStatus = status;
     row.manualActionUpdatedAt = updatedAt;
     row.manualActionOperator = operatorName || row.manualActionOperator || '';
-    if (status === '弃用' || status === '已完成') row.manualActionable = '是';
+    if (status === '已下架' || status === '已完成') row.manualActionable = '是';
     invalidateSearchCache(row);
     changed += 1;
   }
@@ -1540,7 +1690,7 @@ function updateRowsManualStatuses(rowKeys, status, updatedAt, operatorName = '')
     row.manualProcessStatus = status;
     row.manualActionUpdatedAt = updatedAt;
     row.manualActionOperator = operatorName || row.manualActionOperator || '';
-    if (status === '弃用' || status === '已完成') row.manualActionable = '是';
+    if (status === '已下架' || status === '已完成') row.manualActionable = '是';
     invalidateSearchCache(row);
     changed += 1;
   }
@@ -1812,7 +1962,7 @@ function notePanelElements() {
 }
 
 function noteRowMeta(row) {
-  return [row.platformSpu ? `SPU ${row.platformSpu}` : '', row.storeRegion, row.stockAction].filter(Boolean).join(' / ');
+  return [row.platformSpu ? `SPU ${row.platformSpu}` : '', row.storeRegion, row.stockAction || row.priceAlert].filter(Boolean).join(' / ');
 }
 
 function openNotePanel(rowKey) {
@@ -1977,9 +2127,9 @@ function handleNotePanelClick(event) {
 }
 
 function recalcManualMetrics() {
-  state.meta.manual_pending_rows = state.rows.filter(row => row.manualProcessStatus === '未处理').length;
+  state.meta.manual_pending_rows = state.rows.filter(row => row.manualProcessStatus === '未完成').length;
   state.meta.manual_done_rows = state.rows.filter(row => row.manualProcessStatus === '已完成').length;
-  state.meta.manual_abandoned_rows = state.rows.filter(row => row.manualProcessStatus === '弃用').length;
+  state.meta.manual_abandoned_rows = state.rows.filter(row => row.manualProcessStatus === '已下架').length;
   renderMetrics(state.meta);
 }
 
@@ -2030,6 +2180,7 @@ async function loadData(options = {}) {
     renderMetrics(state.meta);
     renderUpdateStatus(payload);
     els.sourceLine.textContent = config.sourceLine(payload);
+    updateStickyControlOffset();
     renderFilters();
     applyFilters();
   } finally {
@@ -2108,6 +2259,12 @@ function requestOfficialProductsUpload() {
   els.officialProductsFileInput.click();
 }
 
+function requestBackendProductsUpload() {
+  if (!els.backendProductsFileInput) return;
+  els.backendProductsFileInput.value = '';
+  els.backendProductsFileInput.click();
+}
+
 function officialUploadContentType(file) {
   if (/\.json$/i.test(file.name)) return 'application/json';
   if (/\.csv$/i.test(file.name)) return 'text/csv;charset=utf-8';
@@ -2141,7 +2298,7 @@ async function uploadOfficialProductsFile(file) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || '上传失败');
     const data = payload.data || {};
-    alert(`TEMU前端价格已更新：上传 ${data.rowCount || 0} 行；价格快照 ${data.snapshot?.rowCount || 0} 行`);
+    alert(`TEMU前端价格已更新：本次上传 ${data.rowCount || 0} 行；新增 ${data.insertedRows || 0} 行；覆盖重复 ${data.updatedRows || 0} 行；累计保存 ${data.storedRows || 0} 行；价格快照 ${data.snapshot?.rowCount || 0} 行`);
     await loadHealth();
     await loadData({ reason: 'official-products-upload' });
   } catch (error) {
@@ -2152,6 +2309,48 @@ async function uploadOfficialProductsFile(file) {
       button.textContent = '上传前端价格';
     }
     if (els.officialProductsFileInput) els.officialProductsFileInput.value = '';
+  }
+}
+
+async function uploadBackendProductsFile(file) {
+  const operator = await ensureOperator();
+  if (!operator || !file) return;
+  if (!/\.(csv|xlsx|xls|json)$/i.test(file.name)) {
+    alert('只支持上传 .csv、.xlsx、.xls、.json 文件');
+    return;
+  }
+
+  const button = els.uploadBackendProductsBtn;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '上传中';
+  }
+  try {
+    const response = await fetch('/api/temu-backend-products/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': officialUploadContentType(file),
+        'Authorization': `Bearer ${operator.authToken}`,
+        'X-Upload-Filename': encodeURIComponent(file.name)
+      },
+      body: file
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error?.message || '上传失败');
+    const data = payload.data || {};
+    const stores = (data.stores || []).join('、') || '未识别店铺';
+    const sites = (data.sites || []).join('、') || '未识别站点';
+    alert(`TEMU后台数据已更新：本次上传 ${data.rowCount || 0} 行；局部覆盖移除 ${data.removedByScope || 0} 行；新增 ${data.insertedRows || 0} 行；覆盖重复 ${data.updatedRows || 0} 行；累计保存 ${data.storedRows || 0} 行；价格快照 ${data.snapshot?.rowCount || 0} 行。\n店铺：${stores}\n站点：${sites}`);
+    await loadHealth();
+    await loadData({ reason: 'backend-products-upload' });
+  } catch (error) {
+    await handleActionError(error);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '上传后台数据';
+    }
+    if (els.backendProductsFileInput) els.backendProductsFileInput.value = '';
   }
 }
 
@@ -2220,6 +2419,7 @@ function exportFiltered() {
 }
 
 renderPageChrome();
+updateStickyControlOffset();
 loadStoredOperator();
 renderOperatorUi();
 updateSelectionUi();
@@ -2246,12 +2446,17 @@ document.addEventListener('keydown', event => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') checkForRemoteUpdate();
 });
+window.addEventListener('resize', debounce(updateStickyControlOffset, 120));
 
 els.operatorBtn?.addEventListener('click', () => openAuthPanel());
 els.operationLogBtn?.addEventListener('click', openOperationLogPanel);
 els.uploadOfficialProductsBtn?.addEventListener('click', requestOfficialProductsUpload);
 els.officialProductsFileInput?.addEventListener('change', event => {
   uploadOfficialProductsFile(event.target.files?.[0]).catch(error => alert(error.message));
+});
+els.uploadBackendProductsBtn?.addEventListener('click', requestBackendProductsUpload);
+els.backendProductsFileInput?.addEventListener('change', event => {
+  uploadBackendProductsFile(event.target.files?.[0]).catch(error => alert(error.message));
 });
 els.uploadOwnerMappingBtn?.addEventListener('click', requestOwnerMappingUpload);
 els.ownerMappingFileInput?.addEventListener('change', event => {
@@ -2265,11 +2470,12 @@ els.clearFiltersBtn.addEventListener('click', clearFilters);
 els.bulkClaimBtn?.addEventListener('click', () => claimOwnerForRows(requireSelectedRowKeys()));
 els.bulkNoteBtn?.addEventListener('click', openBatchNotePanel);
 els.bulkDoneBtn?.addEventListener('click', () => bulkSetStatus('已完成'));
-els.bulkAbandonBtn?.addEventListener('click', () => bulkSetStatus('弃用'));
+els.bulkAbandonBtn?.addEventListener('click', () => bulkSetStatus('已下架'));
 els.clearSelectionBtn?.addEventListener('click', clearSelection);
 
 loadData().catch(error => {
   els.updateStatus.textContent = `读取失败：${error.message}`;
   els.sourceLine.textContent = `读取失败：${error.message}`;
+  updateStickyControlOffset();
   els.tableBody.innerHTML = `<tr><td colspan="${config.columns.length}" class="empty">${escapeHtml(error.message)}</td></tr>`;
 });

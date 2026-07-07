@@ -13,6 +13,8 @@ RUN npm ci --omit=dev
 COPY src ./src
 COPY public ./public
 COPY scripts/init_db.js ./scripts/init_db.js
+COPY scripts/import_dashboard_snapshot.js ./scripts/import_dashboard_snapshot.js
+COPY scripts/import_dashboard_snapshot_file.js ./scripts/import_dashboard_snapshot_file.js
 COPY scripts/provision_dashboard_operators.js ./scripts/provision_dashboard_operators.js
 COPY scripts/backfill_action_authors_from_owner.js ./scripts/backfill_action_authors_from_owner.js
 

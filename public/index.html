@@ -19,6 +19,8 @@
         <a id="returnLabelNav" class="nav-link" href="/api/return-label/open" target="_blank" rel="noreferrer">退货面单</a>
         <button id="operatorBtn" type="button" class="secondary operator-button">操作人：未设置</button>
         <button id="operationLogBtn" type="button" class="secondary">操作记录</button>
+        <button id="uploadBackendProductsBtn" type="button" class="secondary price-only-action">上传后台数据</button>
+        <input id="backendProductsFileInput" type="file" accept=".csv,.xlsx,.xls,.json" hidden />
         <button id="uploadOfficialProductsBtn" type="button" class="secondary price-only-action">上传前端价格</button>
         <input id="officialProductsFileInput" type="file" accept=".csv,.xlsx,.xls,.json" hidden />
         <button id="uploadOwnerMappingBtn" type="button" class="secondary">上传SKU-运营表</button>
@@ -33,23 +35,25 @@
     <main>
       <section id="metricGrid" class="metrics" aria-label="汇总指标"></section>
 
-      <section class="filters" aria-label="筛选">
-        <div class="quick-search">
-          <input id="searchInput" type="search" placeholder="搜索 SPU / SKC / SKU / 标题 / 负责人 / 店铺" />
-          <button id="clearFiltersBtn" type="button" class="secondary">清空筛选</button>
-          <span id="resultCount" class="result-count">0 / 0</span>
-        </div>
-        <div id="filterGrid" class="filter-grid"></div>
-      </section>
+      <div class="sticky-controls">
+        <section class="filters" aria-label="筛选">
+          <div class="quick-search">
+            <input id="searchInput" type="search" placeholder="搜索 SPU / SKC / SKU / 标题 / 负责人 / 店铺" />
+            <button id="clearFiltersBtn" type="button" class="secondary">清空筛选</button>
+            <span id="resultCount" class="result-count">0 / 0</span>
+          </div>
+          <div id="filterGrid" class="filter-grid"></div>
+        </section>
 
-      <section class="batch-toolbar" aria-label="批量操作">
-        <span id="selectionCount" class="selection-count">已选 0</span>
-        <button id="bulkClaimBtn" type="button" class="secondary">批量认领</button>
-        <button id="bulkNoteBtn" type="button" class="secondary">批量备注</button>
-        <button id="bulkDoneBtn" type="button" class="secondary">批量已完成</button>
-        <button id="bulkAbandonBtn" type="button" class="secondary danger-action">批量弃用</button>
-        <button id="clearSelectionBtn" type="button" class="secondary">清空选择</button>
-      </section>
+        <section class="batch-toolbar" aria-label="批量操作">
+          <span id="selectionCount" class="selection-count">已选 0</span>
+          <button id="bulkClaimBtn" type="button" class="secondary">批量认领</button>
+          <button id="bulkNoteBtn" type="button" class="secondary">批量备注</button>
+          <button id="bulkDoneBtn" type="button" class="secondary">批量已完成</button>
+          <button id="bulkAbandonBtn" type="button" class="secondary danger-action">批量已下架</button>
+          <button id="clearSelectionBtn" type="button" class="secondary">清空选择</button>
+        </section>
+      </div>
 
       <section class="table-shell">
         <table>

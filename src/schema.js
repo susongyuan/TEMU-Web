@@ -1,6 +1,23 @@
 let dashboardSchemaInitPromise = null;
+const LEGACY_ACTION_BACKFILL_MIGRATION = 'dashboard_legacy_action_backfill_v1';
+
+function schemaTrace(message) {
+  if (process.env.DASHBOARD_IMPORT_TRACE === '1') {
+    console.log(`[SCHEMA] ${message}`);
+  }
+}
+
+async function hasMigration(db, key) {
+  const [rows] = await db.query('SELECT migration_key FROM dashboard_schema_migrations WHERE migration_key = ? LIMIT 1', [key]);
+  return rows.length > 0;
+}
+
+async function markMigration(db, key) {
+  await db.query('INSERT IGNORE INTO dashboard_schema_migrations (migration_key) VALUES (?)', [key]);
+}
 
 async function runDashboardSchemaInit(db) {
+  schemaTrace('create dashboard_operators');
   await db.query(`
     CREATE TABLE IF NOT EXISTS dashboard_operators (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -80,11 +97,35 @@ async function runDashboardSchemaInit(db) {
   `);
 
   await db.query(`
+    CREATE TABLE IF NOT EXISTS temu_official_products (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      row_index INT UNSIGNED NOT NULL,
+      row_json JSON NOT NULL,
+      uploaded_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      KEY idx_temu_official_products_index (row_index),
+      KEY idx_temu_official_products_uploaded (uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS temu_backend_products (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      row_index INT UNSIGNED NOT NULL,
+      row_json JSON NOT NULL,
+      uploaded_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (id),
+      KEY idx_temu_backend_products_index (row_index),
+      KEY idx_temu_backend_products_uploaded (uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await db.query(`
     CREATE TABLE IF NOT EXISTS dashboard_row_actions (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       mode VARCHAR(32) NOT NULL,
       row_key VARCHAR(255) NOT NULL,
-      status VARCHAR(32) NOT NULL DEFAULT '未处理',
+      status VARCHAR(32) NOT NULL DEFAULT '未完成',
       note TEXT NULL,
       legacy_note_migrated_at TIMESTAMP(3) NULL DEFAULT NULL,
       updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -208,6 +249,33 @@ async function runDashboardSchemaInit(db) {
   `);
 
   await db.query(`
+    CREATE TABLE IF NOT EXISTS dashboard_schema_migrations (
+      migration_key VARCHAR(128) NOT NULL,
+      applied_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      PRIMARY KEY (migration_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  if (await hasMigration(db, LEGACY_ACTION_BACKFILL_MIGRATION)) {
+    schemaTrace('legacy action backfill already marked');
+    return;
+  }
+
+  const [pendingLegacyRows] = await db.query(`
+    SELECT COUNT(*) AS pending_count
+    FROM dashboard_row_actions
+    WHERE legacy_note_migrated_at IS NULL
+  `);
+  const pendingLegacyCount = Number(pendingLegacyRows[0]?.pending_count || 0);
+  if (pendingLegacyCount <= 0) {
+    schemaTrace('legacy action backfill has no pending rows; mark done');
+    await markMigration(db, LEGACY_ACTION_BACKFILL_MIGRATION);
+    return;
+  }
+
+  schemaTrace(`legacy action backfill pending rows=${pendingLegacyCount}`);
+
+  await db.query(`
     INSERT INTO dashboard_operators (operator_key, operator_name)
     VALUES ('legacy-shixiaofang', '石小芳')
     ON DUPLICATE KEY UPDATE operator_name = VALUES(operator_name)
@@ -309,7 +377,7 @@ async function runDashboardSchemaInit(db) {
       JSON_OBJECT('status', a.status, 'historicalBackfill', true),
       COALESCE(a.updated_at, a.created_at, CURRENT_TIMESTAMP(3))
     FROM dashboard_row_actions a
-    WHERE a.status IN ('已完成', '弃用')
+    WHERE a.status IN ('已完成', '已下架', '弃用')
       AND NOT EXISTS (
         SELECT 1
         FROM dashboard_operation_logs l
@@ -352,6 +420,8 @@ async function runDashboardSchemaInit(db) {
         LIMIT 1
       )
   `);
+
+  await markMigration(db, LEGACY_ACTION_BACKFILL_MIGRATION);
 }
 
 async function initDashboardSchema(db) {

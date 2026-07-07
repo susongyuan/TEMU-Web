@@ -1,4 +1,5 @@
 const {
+  createHash,
   createHmac,
   randomBytes,
   randomUUID,
@@ -7,8 +8,13 @@ const {
 } = require('crypto');
 const { getPool } = require('./db');
 const { initDashboardSchema } = require('./schema');
+const {
+  buildPriceDataFromBackendAndOfficialRowsAsync,
+  normalizeBackendExport,
+  normalizeOfficial
+} = require('./data-loader');
 
-const INSERT_BATCH_SIZE = 500;
+const INSERT_BATCH_SIZE = Number(process.env.DASHBOARD_INSERT_BATCH_SIZE || 1000);
 const MYSQL_DATETIME_FORMAT = '%Y-%m-%d %H:%i:%s';
 const OPERATOR_NAME_MAX_LENGTH = 32;
 const PASSWORD_MIN_LENGTH = 4;
@@ -25,9 +31,15 @@ const OPERATION_ACTION_LABELS = {
   note_update: '编辑备注',
   note_delete: '删除备注',
   sku_owner_mapping_upload: '上传SKU-运营表',
+  temu_backend_products_upload: '上传TEMU后台数据',
   temu_official_products_upload: '上传TEMU前端价格'
 };
-const ROW_ACTION_STATUSES = ['未处理', '已完成', '弃用'];
+const ROW_ACTION_STATUSES = ['未完成', '已完成', '已下架'];
+const LEGACY_ROW_ACTION_STATUS_MAP = {
+  '未处理': '未完成',
+  '弃用': '已下架'
+};
+const FINAL_ROW_ACTION_STATUSES = new Set(['已完成', '已下架']);
 
 function parseJson(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -38,6 +50,11 @@ function parseJson(value, fallback) {
 
 function text(value) {
   return String(value || '').trim();
+}
+
+function normalizeSavedRowActionStatus(value) {
+  const status = text(value);
+  return LEGACY_ROW_ACTION_STATUS_MAP[status] || status;
 }
 
 function dateText(value) {
@@ -160,6 +177,12 @@ function operatorDto(row, { includeToken = false } = {}) {
 function jsonOrNull(value) {
   if (value === undefined || value === null) return null;
   return JSON.stringify(value);
+}
+
+function importTrace(message) {
+  if (process.env.DASHBOARD_IMPORT_TRACE === '1') {
+    console.log(`[IMPORT] ${message}`);
+  }
 }
 
 function operationLabel(actionType, fallback = '') {
@@ -480,34 +503,480 @@ async function insertRows(connection, snapshotId, mode, rows) {
       'INSERT INTO dashboard_rows (snapshot_id, mode, row_index, row_key, row_json) VALUES ?',
       [values]
     );
+    const inserted = Math.min(start + batch.length, rows.length);
+    if (inserted === rows.length || inserted % 1000 === 0) {
+      console.log(`[IMPORT] ${mode}: inserted ${inserted}/${rows.length} rows`);
+    }
   }
+}
+
+function hasTemuOfficialRows(data = {}) {
+  const summaryCount = Number(data.summary?.temu_official_rows || 0);
+  const officialSource = data.sources?.temu_official || null;
+  const sourceCount = Number(officialSource?.row_count || 0);
+  if (summaryCount > 0 || sourceCount > 0) return true;
+  if (officialSource?.type && !['empty', 'pending_upload_db_merge'].includes(String(officialSource.type))) return true;
+  return (Array.isArray(data.rows) ? data.rows : []).some(row =>
+    row?.sourceSide === 'TEMU官方' ||
+    text(row?.officialTitle) ||
+    text(row?.officialPrice)
+  );
+}
+
+async function loadTemuOfficialProducts(connectionOrPool = getPool()) {
+  const [rows] = await connectionOrPool.execute(
+    `SELECT row_index, CAST(row_json AS CHAR) AS row_json, uploaded_at
+     FROM temu_official_products
+     ORDER BY row_index ASC`
+  );
+  return rows.map(row => ({
+    row: parseJson(row.row_json, {}),
+    uploadedAt: dateText(row.uploaded_at)
+  }));
+}
+
+async function replaceTemuOfficialProducts(rows) {
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const connection = await pool.getConnection();
+  const cleanRows = (Array.isArray(rows) ? rows : [])
+    .filter(row => row && typeof row === 'object');
+
+  try {
+    await connection.beginTransaction();
+    await connection.execute('DELETE FROM temu_official_products');
+    for (let start = 0; start < cleanRows.length; start += INSERT_BATCH_SIZE) {
+      const batch = cleanRows.slice(start, start + INSERT_BATCH_SIZE);
+      const values = batch.map((row, offset) => [
+        start + offset,
+        JSON.stringify(row)
+      ]);
+      await connection.query(
+        'INSERT INTO temu_official_products (row_index, row_json) VALUES ?',
+        [values]
+      );
+    }
+    await connection.commit();
+    return { rowCount: cleanRows.length };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function loadTemuBackendProducts(connectionOrPool = getPool()) {
+  const [rows] = await connectionOrPool.execute(
+    `SELECT row_index, CAST(row_json AS CHAR) AS row_json, uploaded_at
+     FROM temu_backend_products
+     ORDER BY row_index ASC`
+  );
+  return rows.map(row => ({
+    row: parseJson(row.row_json, {}),
+    uploadedAt: dateText(row.uploaded_at)
+  }));
+}
+
+function cleanBackendProductRows(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => row && typeof row === 'object');
+}
+
+function backendUploadIdentityParts(row) {
+  const backend = normalizeBackendExport([row], 'TEMU后台上传数据')[0] || {};
+  const store = identityToken(backend.mallId) || identityToken(backend.storeName);
+  const site = identityToken(backend.site || backend.backendPriceSite || backend.area);
+  const spu = identityToken(backend.platformSpu);
+  const skuId = identityToken(backend.skuId);
+  const skuCode = identityToken(backend.skuCode);
+  const skcId = identityToken(backend.skcId);
+  const title = identityTitle(backend.title);
+  return { store, site, spu, skuId, skuCode, skcId, title };
+}
+
+function backendUploadScope(row) {
+  const { store, site } = backendUploadIdentityParts(row);
+  if (!store) return '';
+  return `${store}:${site || '*'}`;
+}
+
+function backendScopeMatches(uploadScope, rowScope) {
+  if (!uploadScope || !rowScope) return false;
+  const [uploadStore, uploadSite] = uploadScope.split(':');
+  const [rowStore, rowSite] = rowScope.split(':');
+  if (!uploadStore || uploadStore !== rowStore) return false;
+  return uploadSite === '*' || uploadSite === rowSite;
+}
+
+function backendUploadIdentityKey(row) {
+  const { store, site, spu, skuId, skuCode, skcId, title } = backendUploadIdentityParts(row);
+  const item = skuId || skuCode || skcId || title;
+  if (store && site && spu && item) return `store-site-spu-item:${store}:${site}:${spu}:${item}`;
+  if (store && spu && item) return `store-spu-item:${store}:${spu}:${item}`;
+  if (store && site && title) return `store-site-title:${store}:${site}:${title}`;
+  if (store && title) return `store-title:${store}:${title}`;
+  if (spu && item) return `spu-item:${spu}:${item}`;
+  if (spu && site) return `spu-site:${spu}:${site}`;
+  if (title && site) return `title-site:${title}:${site}`;
+  if (title) return `title:${title}`;
+  return officialRowHash(row);
+}
+
+function mergeTemuBackendProductRows(existingRows, rows) {
+  const currentRows = cleanBackendProductRows(existingRows);
+  const uploadRows = cleanBackendProductRows(rows);
+  const uploadScopes = new Set(uploadRows.map(backendUploadScope).filter(Boolean));
+  const scopedExistingRows = uploadScopes.size
+    ? currentRows.filter(row => {
+      const rowScope = backendUploadScope(row);
+      return ![...uploadScopes].some(scope => backendScopeMatches(scope, rowScope));
+    })
+    : currentRows;
+  const removedByScope = currentRows.length - scopedExistingRows.length;
+  const mergedRows = [];
+  const indexByKey = new Map();
+  let updatedRows = 0;
+  let insertedRows = 0;
+
+  const upsert = (row, countAsUpload = false) => {
+    const key = backendUploadIdentityKey(row);
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex !== undefined) {
+      mergedRows[existingIndex] = row;
+      if (countAsUpload) updatedRows += 1;
+      return;
+    }
+    indexByKey.set(key, mergedRows.length);
+    mergedRows.push(row);
+    if (countAsUpload) insertedRows += 1;
+  };
+
+  for (const row of scopedExistingRows) upsert(row, false);
+  for (const row of uploadRows) upsert(row, true);
+
+  return {
+    rowCount: mergedRows.length,
+    uploadedRows: uploadRows.length,
+    insertedRows,
+    updatedRows,
+    removedByScope,
+    scopes: [...uploadScopes],
+    rows: mergedRows
+  };
+}
+
+async function writeTemuBackendProducts(connection, rows) {
+  await connection.execute('DELETE FROM temu_backend_products');
+  for (let start = 0; start < rows.length; start += INSERT_BATCH_SIZE) {
+    const batch = rows.slice(start, start + INSERT_BATCH_SIZE);
+    const values = batch.map((row, offset) => [
+      start + offset,
+      JSON.stringify(row)
+    ]);
+    await connection.query(
+      'INSERT INTO temu_backend_products (row_index, row_json) VALUES ?',
+      [values]
+    );
+  }
+}
+
+async function mergeTemuBackendProducts(rows) {
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const connection = await pool.getConnection();
+  const uploadRows = cleanBackendProductRows(rows);
+
+  try {
+    await connection.beginTransaction();
+    const existingRows = (await loadTemuBackendProducts(connection)).map(item => item.row);
+    const merged = mergeTemuBackendProductRows(existingRows, uploadRows);
+
+    await writeTemuBackendProducts(connection, merged.rows);
+    await connection.commit();
+    return merged;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function officialUploadIdentityParts(row) {
+  const official = normalizeOfficial([row])[0] || {};
+  const mallId = identityToken(official.mallId);
+  const goodsId = identityToken(official.goodsId);
+  const site = identityToken(official.officialSite || official.site);
+  const store = mallId || identityToken(official.storeName);
+  const title = identityTitle(official.title);
+  const skuCode = identityToken(official.skuCode);
+  const imageKey = identityToken(official.imageHash || official.image);
+  return { mallId, goodsId, site, store, title, skuCode, imageKey };
+}
+
+function identityToken(value) {
+  return text(value).toLowerCase().replace(/[^\p{Letter}\p{Number}\u4e00-\u9fa5]+/gu, '').trim();
+}
+
+function identityTitle(value) {
+  return text(value).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function officialRowHash(row) {
+  return `row-hash:${createHash('sha1').update(JSON.stringify(row || {})).digest('hex')}`;
+}
+
+function officialUploadPreciseIdentityKeys(row) {
+  const { mallId, goodsId, site, store, title, skuCode, imageKey } = officialUploadIdentityParts(row);
+  const keys = [];
+  const add = key => {
+    if (key && !keys.includes(key)) keys.push(key);
+  };
+  if (mallId && goodsId && site) add(`mall-goods-site:${mallId}:${goodsId}:${site}`);
+  if (store && title && site) add(`store-site-title:${store}:${site}:${title}`);
+  if (store && imageKey && site) add(`store-site-image:${store}:${site}:${imageKey}`);
+  if (store && skuCode && site) add(`store-site-sku:${store}:${site}:${skuCode}`);
+  if (goodsId && site) add(`goods-site:${goodsId}:${site}`);
+  if (title && imageKey && site) add(`title-image-site:${site}:${title}:${imageKey}`);
+  if (title && site) add(`title-site:${site}:${title}`);
+  if (imageKey && site) add(`image:${site}:${imageKey}`);
+  if (skuCode && site) add(`sku:${site}:${skuCode}`);
+  if (!keys.length && !site) add(officialRowHash(row));
+  return keys;
+}
+
+function officialUploadBroadIdentityKeys(row) {
+  const { mallId, goodsId, site, store, title, skuCode, imageKey } = officialUploadIdentityParts(row);
+  const sitePart = site || 'unknown';
+  const keys = [];
+  const add = key => {
+    if (key && !keys.includes(key)) keys.push(key);
+  };
+  if (mallId && goodsId) add(`mall-goods:${mallId}:${goodsId}`);
+  if (store && title) add(`store-title:${store}:${title}`);
+  if (store && imageKey) add(`store-image:${store}:${imageKey}`);
+  if (store && skuCode) add(`store-sku:${store}:${skuCode}`);
+  if (goodsId) add(`goods:${goodsId}`);
+  if (title && imageKey) add(`title-image:${title}:${imageKey}`);
+  if (title) add(`title:${title}`);
+  if (imageKey) add(`image:${sitePart}:${imageKey}`);
+  if (skuCode) add(`sku:${sitePart}:${skuCode}`);
+  if (!keys.length) add(`row-hash:${stableHash(JSON.stringify(row || {}))}`);
+  return keys;
+}
+
+function hasOfficialUploadSite(row) {
+  return Boolean(officialUploadIdentityParts(row).site);
+}
+
+function firstMappedIndex(keys, map) {
+  for (const key of keys) {
+    const index = map.get(key);
+    if (index !== undefined) return index;
+  }
+  return undefined;
+}
+
+function cleanOfficialProductRows(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => row && typeof row === 'object');
+}
+
+function mergeTemuOfficialProductRows(existingRows, rows) {
+  const currentRows = cleanOfficialProductRows(existingRows);
+  const uploadRows = cleanOfficialProductRows(rows);
+  const mergedRows = [];
+  const preciseIndexByKey = new Map();
+  const broadIndexByKey = new Map();
+  let updatedRows = 0;
+  let insertedRows = 0;
+  const addRowIndex = (row, rowIndex) => {
+    for (const key of officialUploadPreciseIdentityKeys(row)) preciseIndexByKey.set(key, rowIndex);
+    if (!hasOfficialUploadSite(row)) {
+      for (const key of officialUploadBroadIdentityKeys(row)) broadIndexByKey.set(key, rowIndex);
+    }
+  };
+  const deleteBroadRowIndex = (row, rowIndex) => {
+    for (const key of officialUploadBroadIdentityKeys(row)) {
+      if (broadIndexByKey.get(key) === rowIndex) broadIndexByKey.delete(key);
+    }
+  };
+
+  for (const row of currentRows) {
+    const preciseKeys = officialUploadPreciseIdentityKeys(row);
+    const broadKeys = officialUploadBroadIdentityKeys(row);
+    const existingIndex = firstMappedIndex(preciseKeys, preciseIndexByKey) ??
+      (!hasOfficialUploadSite(row) ? firstMappedIndex(broadKeys, broadIndexByKey) : undefined);
+    if (existingIndex !== undefined) {
+      mergedRows[existingIndex] = row;
+      addRowIndex(row, existingIndex);
+      continue;
+    }
+    const rowIndex = mergedRows.length;
+    mergedRows.push(row);
+    addRowIndex(row, rowIndex);
+  }
+
+  for (const row of uploadRows) {
+    const preciseKeys = officialUploadPreciseIdentityKeys(row);
+    const broadKeys = officialUploadBroadIdentityKeys(row);
+    const existingIndex = firstMappedIndex(preciseKeys, preciseIndexByKey) ??
+      firstMappedIndex(broadKeys, broadIndexByKey);
+    if (existingIndex !== undefined) {
+      const previousRow = mergedRows[existingIndex];
+      deleteBroadRowIndex(previousRow, existingIndex);
+      mergedRows[existingIndex] = row;
+      addRowIndex(row, existingIndex);
+      updatedRows += 1;
+    } else {
+      const rowIndex = mergedRows.length;
+      mergedRows.push(row);
+      addRowIndex(row, rowIndex);
+      insertedRows += 1;
+    }
+  }
+
+  return {
+    rowCount: mergedRows.length,
+    uploadedRows: uploadRows.length,
+    insertedRows,
+    updatedRows,
+    rows: mergedRows
+  };
+}
+
+async function writeTemuOfficialProducts(connection, rows) {
+  await connection.execute('DELETE FROM temu_official_products');
+  for (let start = 0; start < rows.length; start += INSERT_BATCH_SIZE) {
+    const batch = rows.slice(start, start + INSERT_BATCH_SIZE);
+    const values = batch.map((row, offset) => [
+      start + offset,
+      JSON.stringify(row)
+    ]);
+    await connection.query(
+      'INSERT INTO temu_official_products (row_index, row_json) VALUES ?',
+      [values]
+    );
+  }
+}
+
+async function mergeTemuOfficialProducts(rows) {
+  const pool = getPool();
+  await initDashboardSchema(pool);
+  const connection = await pool.getConnection();
+  const uploadRows = cleanOfficialProductRows(rows);
+
+  try {
+    await connection.beginTransaction();
+    const existingRows = (await loadTemuOfficialProducts(connection)).map(item => item.row);
+    const merged = mergeTemuOfficialProductRows(existingRows, uploadRows);
+
+    await writeTemuOfficialProducts(connection, merged.rows);
+    await connection.commit();
+    return merged;
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function mergePersistedTemuOfficialProducts(data, connection) {
+  if (String(data.mode) !== 'price' || hasTemuOfficialRows(data)) return data;
+
+  const officialRows = await loadTemuOfficialProducts(connection);
+  if (!officialRows.length) return data;
+
+  const { mergeOfficialRowsIntoPriceSnapshotAsync } = require('./data-loader');
+  const merged = await mergeOfficialRowsIntoPriceSnapshotAsync(data, officialRows.map(item => item.row));
+  const updatedAt = officialRows
+    .map(item => item.uploadedAt)
+    .filter(Boolean)
+    .sort()
+    .pop() || new Date().toISOString();
+  return {
+    ...merged,
+    sources: {
+      ...(merged.sources || {}),
+      temu_official: {
+        type: 'upload_db',
+        row_count: officialRows.length,
+        updated_at: updatedAt
+      }
+    },
+    summary: {
+      ...(merged.summary || {}),
+      temu_official_rows: officialRows.length
+    }
+  };
+}
+
+async function mergePersistedTemuBackendProducts(data, connection) {
+  if (String(data.mode) !== 'price') return data;
+
+  const backendRows = await loadTemuBackendProducts(connection);
+  if (!backendRows.length) return data;
+
+  const updatedAt = backendRows
+    .map(item => item.uploadedAt)
+    .filter(Boolean)
+    .sort()
+    .pop() || new Date().toISOString();
+  return buildPriceDataFromBackendAndOfficialRowsAsync(
+    backendRows.map(item => item.row),
+    [],
+    {
+      backendSource: {
+        type: 'upload_db',
+        row_count: backendRows.length,
+        updated_at: updatedAt
+      },
+      officialSource: data.sources?.temu_official || {
+        type: 'pending_upload_db_merge',
+        row_count: 0,
+        updated_at: updatedAt
+      }
+    }
+  );
 }
 
 async function saveDashboardSnapshot(data) {
   if (!data || !data.mode) throw new Error('Invalid dashboard data: missing mode');
 
   const pool = getPool();
+  importTrace(`${data.mode}: init schema`);
   await initDashboardSchema(pool);
+  importTrace(`${data.mode}: get connection`);
   const connection = await pool.getConnection();
-  const mode = String(data.mode);
-  const rowInput = filterRowsBeforeInsert(data.rows);
+  importTrace(`${data.mode}: merge persisted backend products`);
+  const dataWithBackend = await mergePersistedTemuBackendProducts(data, connection);
+  importTrace(`${dataWithBackend.mode}: merge persisted official products`);
+  const dataToSave = await mergePersistedTemuOfficialProducts(dataWithBackend, connection);
+  const mode = String(dataToSave.mode);
+  importTrace(`${mode}: filter rows`);
+  const rowInput = filterRowsBeforeInsert(dataToSave.rows);
   const rows = rowInput.rows;
-  const generatedAt = data.generated_at || new Date().toISOString();
+  const generatedAt = dataToSave.generated_at || new Date().toISOString();
   const summary = {
-    ...(data.summary || {}),
-    db_import_raw_rows: Array.isArray(data.rows) ? data.rows.length : 0,
+    ...(dataToSave.summary || {}),
+    db_import_raw_rows: Array.isArray(dataToSave.rows) ? dataToSave.rows.length : 0,
     db_import_excluded_void_status_rows: rowInput.excludedVoidStatusRows
   };
 
   try {
+    importTrace(`${mode}: begin transaction, rows=${rows.length}`);
     await connection.beginTransaction();
 
+    importTrace(`${mode}: insert sync run`);
     const [syncRunResult] = await connection.execute(
       'INSERT INTO sync_runs (source, status, row_count, message, summary_json) VALUES (?, ?, ?, ?, ?)',
       [`dashboard:${mode}`, 'running', rows.length, 'import started', JSON.stringify(summary)]
     );
     const syncRunId = syncRunResult.insertId;
 
+    importTrace(`${mode}: insert snapshot`);
     const [snapshotResult] = await connection.execute(
       `INSERT INTO dashboard_snapshots
        (mode, generated_at, summary_json, sources_json, row_count)
@@ -516,15 +985,18 @@ async function saveDashboardSnapshot(data) {
         mode,
         generatedAt,
         JSON.stringify(summary),
-        JSON.stringify(data.sources || {}),
+        JSON.stringify(dataToSave.sources || {}),
         rows.length
       ]
     );
     const snapshotId = snapshotResult.insertId;
 
+    importTrace(`${mode}: insert rows`);
     if (rows.length) await insertRows(connection, snapshotId, mode, rows);
 
+    importTrace(`${mode}: delete old snapshots`);
     await connection.execute('DELETE FROM dashboard_snapshots WHERE mode = ? AND id <> ?', [mode, snapshotId]);
+    importTrace(`${mode}: update sync run`);
     await connection.execute(
       `UPDATE sync_runs
        SET status = ?, finished_at = CURRENT_TIMESTAMP(3), row_count = ?, message = ?, summary_json = ?
@@ -537,13 +1009,16 @@ async function saveDashboardSnapshot(data) {
          SELECT id FROM (
            SELECT id FROM sync_runs WHERE source = ? ORDER BY id DESC LIMIT 50
          ) recent_runs
-       )`,
+      )`,
       [`dashboard:${mode}`, `dashboard:${mode}`]
     );
 
+    importTrace(`${mode}: commit`);
     await connection.commit();
+    importTrace(`${mode}: committed snapshot ${snapshotId}`);
     return { snapshotId, mode, rowCount: rows.length, generatedAt };
   } catch (error) {
+    importTrace(`${mode}: rollback after error`);
     await connection.rollback();
     throw error;
   } finally {
@@ -662,9 +1137,9 @@ async function loadDashboardSnapshot(mode) {
   const summary = {
     ...parseJson(snapshot.summary_json, {}),
     manual_actionable_rows: rows.filter(row => row.manualActionable === '是').length,
-    manual_pending_rows: rows.filter(row => row.manualProcessStatus === '未处理').length,
+    manual_pending_rows: rows.filter(row => row.manualProcessStatus === '未完成').length,
     manual_done_rows: rows.filter(row => row.manualProcessStatus === '已完成').length,
-    manual_abandoned_rows: rows.filter(row => row.manualProcessStatus === '弃用').length
+    manual_abandoned_rows: rows.filter(row => row.manualProcessStatus === '已下架').length
   };
 
   return {
@@ -779,9 +1254,12 @@ function noteLine(note) {
 }
 
 function preferCompletedAction(actions) {
-  const valid = actions.filter(Boolean);
-  return valid.find(action => action.status === '弃用' && text(action.note)) ||
-    valid.find(action => action.status === '弃用') ||
+  const valid = actions.filter(Boolean).map(action => ({
+    ...action,
+    status: normalizeSavedRowActionStatus(action.status)
+  }));
+  return valid.find(action => action.status === '已下架' && text(action.note)) ||
+    valid.find(action => action.status === '已下架') ||
     valid.find(action => action.status === '已完成' && text(action.note)) ||
     valid.find(action => action.status === '已完成') ||
     valid.find(action => text(action.manualOwnerName)) ||
@@ -794,18 +1272,18 @@ async function backfillStableRowActions(pool, mode, actions) {
   const bestByKey = new Map();
   for (const action of actions) {
     const key = text(action?.rowKey);
-    const status = text(action?.status);
+    const status = normalizeSavedRowActionStatus(action?.status);
     const manualOwnerName = text(action?.manualOwnerName);
     if (!key || (!status && !manualOwnerName)) continue;
     const existing = bestByKey.get(key);
     if (!existing ||
-      (existing.status !== '弃用' && status === '弃用') ||
-      (!['弃用', '已完成'].includes(existing.status) && status === '已完成') ||
+      (existing.status !== '已下架' && status === '已下架') ||
+      (!FINAL_ROW_ACTION_STATUSES.has(existing.status) && status === '已完成') ||
       (!text(existing.manualOwnerName) && manualOwnerName)
     ) {
       bestByKey.set(key, {
         rowKey: key,
-        status: status || '未处理',
+        status: status || '未完成',
         manualOwnerName,
         claimedByOperatorKey: text(action?.claimedByOperatorKey),
         claimedByName: text(action?.claimedByName),
@@ -834,7 +1312,7 @@ async function backfillStableRowActions(pool, mode, actions) {
        )
        VALUES ?
        ON DUPLICATE KEY UPDATE
-         status = IF(status IN ('已完成', '弃用'), status, VALUES(status)),
+         status = IF(status IN ('已完成', '已下架', '弃用'), status, VALUES(status)),
          manual_owner_name = COALESCE(manual_owner_name, VALUES(manual_owner_name)),
          claimed_by_operator_key = COALESCE(claimed_by_operator_key, VALUES(claimed_by_operator_key)),
          claimed_by_operator_name = COALESCE(claimed_by_operator_name, VALUES(claimed_by_operator_name)),
@@ -847,21 +1325,20 @@ async function backfillStableRowActions(pool, mode, actions) {
 function isManualActionable(mode, row) {
   if (mode === 'inventory') {
     const action = String(row.stockAction || '').trim();
-    return Boolean(action && action !== '正常');
+    return Boolean(action && action !== '正常' && action !== '仓库地区待确认');
   }
   if (mode === 'price') {
-    const alert = String(row.priceAlert || '').trim();
-    return Boolean(alert && alert !== '价格一致');
+    return row.priceOver20 === '是' || row.priceAlert === '前端超价20%';
   }
   return false;
 }
 
 function withManualActionStatus(mode, row, savedAction, notes = []) {
   const actionable = isManualActionable(mode, row);
-  const savedStatus = String(savedAction?.status || '').trim();
-  const manualProcessStatus = ROW_ACTION_STATUSES.includes(savedStatus) && (actionable || savedStatus !== '未处理')
+  const savedStatus = normalizeSavedRowActionStatus(savedAction?.status);
+  const manualProcessStatus = ROW_ACTION_STATUSES.includes(savedStatus) && (actionable || savedStatus !== '未完成')
     ? savedStatus
-    : actionable ? '未处理' : '无需处理';
+    : actionable ? '未完成' : '无需处理';
   const sortedNotes = sortNotes(notes);
   const latestNote = sortedNotes[0];
   const manualOwnerName = text(savedAction?.manualOwnerName);
@@ -876,7 +1353,7 @@ function withManualActionStatus(mode, row, savedAction, notes = []) {
     manualOwnerName,
     manualOwnerClaimedBy: claimedByName,
     manualOwnerClaimedAt: savedAction?.claimedAt || '',
-    manualActionable: (actionable || ['已完成', '弃用'].includes(manualProcessStatus)) ? '是' : '否',
+    manualActionable: (actionable || FINAL_ROW_ACTION_STATUSES.has(manualProcessStatus)) ? '是' : '否',
     manualProcessStatus,
     manualActionUpdatedAt: latestNote?.createdAt || savedAction?.updatedAt || savedAction?.claimedAt || '',
     manualActionOperator: savedAction?.updatedByName || latestNote?.createdByName || '',
@@ -909,7 +1386,7 @@ function normalizeRowKeys(rowKeys) {
 }
 
 function normalizeRowActionStatus(status) {
-  const normalizedStatus = String(status || '').trim();
+  const normalizedStatus = normalizeSavedRowActionStatus(status);
   if (!ROW_ACTION_STATUSES.includes(normalizedStatus)) throw new Error('处理状态无效');
   return normalizedStatus;
 }
@@ -1021,7 +1498,7 @@ async function setRowActionOwner({ mode, rowKey: key, ownerName, operator }) {
         mode, row_key, status,
         manual_owner_name, claimed_by_operator_key, claimed_by_operator_name, claimed_at
        )
-       VALUES (?, ?, '未处理', ?, ?, ?, CURRENT_TIMESTAMP(3))
+       VALUES (?, ?, '未完成', ?, ?, ?, CURRENT_TIMESTAMP(3))
        ON DUPLICATE KEY UPDATE
          manual_owner_name = VALUES(manual_owner_name),
          claimed_by_operator_key = VALUES(claimed_by_operator_key),
@@ -1167,7 +1644,7 @@ async function setBulkRowActionOwner({ mode, rowKeys, ownerName, operator }) {
           mode, row_key, status,
           manual_owner_name, claimed_by_operator_key, claimed_by_operator_name, claimed_at
          )
-         VALUES (?, ?, '未处理', ?, ?, ?, CURRENT_TIMESTAMP(3))
+         VALUES (?, ?, '未完成', ?, ?, ?, CURRENT_TIMESTAMP(3))
          ON DUPLICATE KEY UPDATE
            manual_owner_name = VALUES(manual_owner_name),
            claimed_by_operator_key = VALUES(claimed_by_operator_key),
@@ -1229,7 +1706,7 @@ async function setBulkRowActionNote({ mode, rowKeys, note, operator }) {
     for (const normalizedKey of keys) {
       await connection.execute(
         `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
-         VALUES (?, ?, '未处理', ?, ?)
+         VALUES (?, ?, '未完成', ?, ?)
          ON DUPLICATE KEY UPDATE row_key = row_key`,
         [normalizedMode, normalizedKey, resolvedOperator.operatorKey, resolvedOperator.operatorName]
       );
@@ -1313,7 +1790,7 @@ async function setRowActionNote({ mode, rowKey: key, note, operator }) {
     await connection.beginTransaction();
     await connection.execute(
       `INSERT INTO dashboard_row_actions (mode, row_key, status, updated_by_operator_key, updated_by_operator_name)
-       VALUES (?, ?, '未处理', ?, ?)
+       VALUES (?, ?, '未完成', ?, ?)
        ON DUPLICATE KEY UPDATE row_key = row_key`,
       [normalizedMode, normalizedKey, resolvedOperator.operatorKey, resolvedOperator.operatorName]
     );
@@ -1597,10 +2074,15 @@ module.exports = {
   loadDashboardSnapshot,
   disableOperatorsExcept,
   logOperation,
+  loadTemuBackendProducts,
+  mergeTemuBackendProducts,
+  mergeTemuOfficialProducts,
+  mergeTemuOfficialProductRows,
   provisionOperator,
   registerOperator,
   resolveOperator,
   rowKey,
+  replaceTemuOfficialProducts,
   saveDashboardSnapshot,
   setBulkRowActionNote,
   setBulkRowActionOwner,

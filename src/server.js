@@ -11,9 +11,15 @@ const {
   buildSkuOwnerIndexFromFile,
   csvParse,
   fileInfo,
-  mergeOfficialRowsIntoPriceSnapshot,
+  mergeOfficialRowsIntoPriceSnapshotAsync,
+  normalizeBackendExport,
   ownerMatchForSkuValues
 } = require('./data-loader');
+const {
+  extractImageUrl,
+  fetchImageResource,
+  hydrateImageHashes
+} = require('./image-hash');
 const {
   deleteRowActionNote,
   loadRawDashboardSnapshot,
@@ -21,7 +27,9 @@ const {
   listOperationLogs,
   listSnapshotStatus,
   logOperation,
+  mergeTemuBackendProducts,
   loginOperator,
+  mergeTemuOfficialProducts,
   resolveOperator,
   saveDashboardSnapshot,
   setBulkRowActionNote,
@@ -50,11 +58,13 @@ const WAREHOUSE_RUNNER = path.join(APP_DIR, 'modules', 'warehouse-inventory-moni
 const DATA_SOURCE = String(process.env.DATA_SOURCE || 'db').toLowerCase();
 const ENABLE_LOCAL_REFRESH = String(process.env.ENABLE_LOCAL_REFRESH || 'false').toLowerCase() === 'true';
 const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 4 * 60 * 60 * 1000);
-const RETURN_LABEL_APP_URL = process.env.RETURN_LABEL_APP_URL || 'http://127.0.0.1:3206';
+const RETURN_LABEL_APP_URL = String(process.env.RETURN_LABEL_APP_URL || '').trim();
+const RETURN_LABEL_APP_PORT = Number(process.env.RETURN_LABEL_APP_PORT || 3206);
 const SKU_OWNER_UPLOAD_DIR = path.join(APP_DIR, 'input');
 const SKU_OWNER_UPLOAD_LIMIT = process.env.SKU_OWNER_UPLOAD_LIMIT || '10mb';
 const OFFICIAL_PRODUCTS_UPLOAD_LIMIT = process.env.TEMU_OFFICIAL_UPLOAD_LIMIT || process.env.OFFICIAL_PRODUCTS_UPLOAD_LIMIT || '20mb';
 const OFFICIAL_PRODUCTS_UPLOAD_TOKEN = process.env.TEMU_OFFICIAL_UPLOAD_TOKEN || process.env.OFFICIAL_PRODUCTS_UPLOAD_TOKEN || '';
+const BACKEND_PRODUCTS_UPLOAD_LIMIT = process.env.TEMU_BACKEND_UPLOAD_LIMIT || '30mb';
 const OFFICIAL_PRODUCTS_FILE = path.join(DATA_DIR, 'temu_official_products.csv');
 
 const app = express();
@@ -64,6 +74,23 @@ const dashboardCache = new Map();
 
 app.use(compression());
 app.use(express.static(PUBLIC_DIR));
+
+app.get('/api/image-proxy', async (req, res) => {
+  try {
+    const url = extractImageUrl(req.query.url || '');
+    if (!url) {
+      res.status(400).send('missing image url');
+      return;
+    }
+    const resource = await fetchImageResource(url);
+    res.setHeader('Content-Type', resource.contentType || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(resource.buffer);
+  } catch (error) {
+    res.status(502).send(error.message || 'image proxy failed');
+  }
+});
+
 app.post(
   '/api/temu-official-products/upload',
   express.raw({
@@ -84,10 +111,12 @@ app.post(
       if (!buffer.length) throw new Error('上传内容不能为空');
 
       const originalName = firstUploadedFileName(req) || 'temu_official_products.csv';
-      const parsed = parseOfficialProductsUpload(buffer, originalName, String(req.headers['content-type'] || ''));
-      const savedFile = saveOfficialProductsUpload(parsed.rows);
       const currentSnapshot = await loadRawDashboardSnapshot('price');
-      const data = mergeOfficialRowsIntoPriceSnapshot(currentSnapshot, parsed.rows);
+      const parsed = parseOfficialProductsUpload(buffer, originalName, String(req.headers['content-type'] || ''));
+      await hydrateImageHashes(parsed.rows);
+      const mergedUpload = await mergeTemuOfficialProducts(parsed.rows);
+      const savedFile = saveOfficialProductsUpload(mergedUpload.rows);
+      const data = await mergeOfficialRowsIntoPriceSnapshotAsync(currentSnapshot, mergedUpload.rows);
       const snapshot = await saveDashboardSnapshot(data);
       invalidateDashboardCache('price');
 
@@ -100,12 +129,19 @@ app.post(
         after: {
           file: savedFile,
           uploadedRows: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
           snapshotRows: snapshot.rowCount
         },
         detail: {
           originalName,
           savedFile: path.basename(savedFile),
           rowCount: parsed.rowCount,
+          uploadedRows: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
           sheetNames: parsed.sheetNames,
           columns: parsed.columns,
           snapshot
@@ -117,6 +153,9 @@ app.post(
           uploaded: true,
           fileName: path.basename(savedFile),
           rowCount: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
           columns: parsed.columns,
           sheetNames: parsed.sheetNames,
           snapshot,
@@ -135,7 +174,111 @@ app.post(
     }
   }
 );
+
+app.post(
+  '/api/temu-backend-products/upload',
+  express.raw({
+    type: [
+      'application/json',
+      'application/octet-stream',
+      'application/vnd.ms-excel',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'text/csv',
+      'text/plain'
+    ],
+    limit: BACKEND_PRODUCTS_UPLOAD_LIMIT
+  }),
+  async (req, res) => {
+    try {
+      const operator = await resolveOperator(getPool(), operatorFromRequest(req));
+      const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
+      if (!buffer.length) throw new Error('上传内容不能为空');
+
+      const originalName = firstUploadedFileName(req) || 'temu_backend_products.xlsx';
+      const parsed = parseBackendProductsUpload(buffer, originalName, String(req.headers['content-type'] || ''));
+      const mergedUpload = await mergeTemuBackendProducts(parsed.rows);
+      const snapshot = await saveDashboardSnapshot({
+        generated_at: new Date().toISOString(),
+        mode: 'price',
+        sources: {},
+        summary: {},
+        rows: []
+      });
+      invalidateDashboardCache('price');
+
+      await logOperation(getPool(), {
+        mode: 'price',
+        actionType: 'temu_backend_products_upload',
+        operator,
+        targetType: 'temu_backend_products',
+        targetId: originalName,
+        after: {
+          uploadedRows: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
+          removedByScope: mergedUpload.removedByScope,
+          snapshotRows: snapshot.rowCount
+        },
+        detail: {
+          originalName,
+          rowCount: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
+          removedByScope: mergedUpload.removedByScope,
+          scopes: mergedUpload.scopes,
+          stores: parsed.stores,
+          sites: parsed.sites,
+          sheetNames: parsed.sheetNames,
+          columns: parsed.columns,
+          snapshot
+        }
+      });
+
+      res.json({
+        data: {
+          uploaded: true,
+          fileName: originalName,
+          rowCount: parsed.rowCount,
+          storedRows: mergedUpload.rowCount,
+          insertedRows: mergedUpload.insertedRows,
+          updatedRows: mergedUpload.updatedRows,
+          removedByScope: mergedUpload.removedByScope,
+          stores: parsed.stores,
+          sites: parsed.sites,
+          scopes: mergedUpload.scopes,
+          columns: parsed.columns,
+          sheetNames: parsed.sheetNames,
+          snapshot,
+          operator
+        }
+      });
+    } catch (error) {
+      const unauthorized = /登录|账号|token|授权|TOKEN/i.test(error.message);
+      const validationError = /上传|文件|表头|数据|格式|只支持|不能为空|后台/i.test(error.message);
+      res.status(unauthorized ? 401 : validationError ? 400 : 500).json({
+        error: {
+          code: unauthorized ? 'UNAUTHORIZED' : 'TEMU_BACKEND_PRODUCTS_UPLOAD_FAILED',
+          message: error.message
+        }
+      });
+    }
+  }
+);
 app.use(express.json({ limit: '1mb' }));
+
+function returnLabelAppUrl(req) {
+  if (RETURN_LABEL_APP_URL) return RETURN_LABEL_APP_URL;
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const rawHost = forwardedHost || req.get('host') || '';
+  const host = rawHost.startsWith('[')
+    ? rawHost.match(/^\[[^\]]+\]/)?.[0]
+    : rawHost.split(':')[0];
+  const protocol = forwardedProto || req.protocol || 'http';
+  return host ? `${protocol}://${host}:${RETURN_LABEL_APP_PORT}` : `http://127.0.0.1:${RETURN_LABEL_APP_PORT}`;
+}
 
 async function getDashboardData(mode) {
   if (DATA_SOURCE === 'file') {
@@ -394,7 +537,28 @@ function validateOfficialUploadRows(rows) {
     'sellersku',
     '商品id',
     'goodsid',
-    'productid'
+    'productid',
+    '图片',
+    '图片链接',
+    '图片url',
+    '前端图片',
+    '前端图片链接',
+    '前端图片url',
+    'temu图片',
+    'temu图片链接',
+    'temu图片url',
+    '官方图片',
+    '官方图片链接',
+    '官方图片url',
+    'image',
+    'imageurl',
+    'img',
+    'imgurl',
+    '主图',
+    'mainimage',
+    'thumbnail',
+    'thumb',
+    'cover'
   ].includes(header));
   const hasPrice = normalized.some(header => [
     'temu价格',
@@ -405,7 +569,7 @@ function validateOfficialUploadRows(rows) {
     'sellingprice',
     'frontendprice'
   ].includes(header));
-  if (!hasIdentity) throw new Error('前端价格表需要包含标题、SKU货号或商品ID列');
+  if (!hasIdentity) throw new Error('前端价格表需要包含标题、SKU货号、商品ID或图片列');
   if (!hasPrice) throw new Error('前端价格表需要包含价格列，例如 TEMU价格/官方价格/price');
   return columns;
 }
@@ -434,6 +598,48 @@ function parseOfficialProductsUpload(buffer, fileName, contentType) {
     rows: normalizedRows,
     rowCount: normalizedRows.length,
     columns,
+    sheetNames
+  };
+}
+
+function validateBackendUploadRows(rows, sourceName) {
+  if (!rows.length) throw new Error('上传文件没有可用后台数据行');
+  const columns = uploadColumnSet(rows);
+  const normalizedRows = normalizeBackendExport(rows, sourceName);
+  if (!normalizedRows.length) throw new Error('后台数据没有可识别的 SPU、SKU 或标题');
+  const usableRows = normalizedRows.filter(row => row.platformSpu || row.skuCode || row.skuId || row.skcId || row.title);
+  if (!usableRows.length) throw new Error('后台数据需要包含 SPU ID、SKU、SKU ID、SKC ID 或商品标题');
+  const stores = [...new Set(normalizedRows.map(row => row.storeName).filter(Boolean))].sort();
+  const sites = [...new Set(normalizedRows.map(row => row.site || row.area).filter(Boolean))].sort();
+  return { columns, stores, sites };
+}
+
+function parseBackendProductsUpload(buffer, fileName, contentType) {
+  const ext = path.extname(fileName || '').toLowerCase();
+  const lowerContentType = String(contentType || '').toLowerCase();
+  let rows = [];
+  let sheetNames = [];
+
+  if (ext === '.json' || lowerContentType.includes('application/json')) {
+    rows = rowsFromJsonUpload(buffer);
+  } else if (['.xlsx', '.xls'].includes(ext) || lowerContentType.includes('spreadsheet') || lowerContentType.includes('ms-excel')) {
+    const workbook = rowsFromWorkbookUpload(buffer);
+    rows = workbook.rows;
+    sheetNames = workbook.sheetNames;
+  } else if (ext === '.csv' || lowerContentType.includes('csv') || lowerContentType.includes('text/plain')) {
+    rows = csvParse(stripBom(buffer.toString('utf8')));
+  } else {
+    throw new Error('只支持上传 .csv、.xlsx、.xls、.json 文件；API上传请带 X-Upload-Filename');
+  }
+
+  const normalizedRows = normalizeOfficialUploadRows(rows);
+  const { columns, stores, sites } = validateBackendUploadRows(normalizedRows, fileName || 'TEMU后台上传数据');
+  return {
+    rows: normalizedRows,
+    rowCount: normalizedRows.length,
+    columns,
+    stores,
+    sites,
     sheetNames
   };
 }
@@ -711,7 +917,7 @@ app.get('/api/return-label/interface', async (req, res) => {
     data: {
       module: 'return-label',
       status: 'available',
-      appUrl: RETURN_LABEL_APP_URL,
+      appUrl: returnLabelAppUrl(req),
       endpoints: [
         { method: 'GET', path: '/api/return-label/open' },
         { method: 'GET', path: '/api/return-label/history' },
@@ -723,7 +929,7 @@ app.get('/api/return-label/interface', async (req, res) => {
 });
 
 app.get('/api/return-label/open', (req, res) => {
-  res.redirect(302, RETURN_LABEL_APP_URL);
+  res.redirect(302, returnLabelAppUrl(req));
 });
 
 app.get('/api/return-label/history', async (req, res) => {
