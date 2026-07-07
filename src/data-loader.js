@@ -38,6 +38,8 @@ const STRICT_TITLE_MATCH_THRESHOLD = 0.85;
 const SAME_STORE_WEAK_TITLE_MATCH_THRESHOLD = 0.5;
 const BACKEND_OFFICIAL_TITLE_MATCH_THRESHOLD = Number(process.env.BACKEND_OFFICIAL_TITLE_MATCH_THRESHOLD || 0.45);
 const BACKEND_OFFICIAL_TRANSLATED_TITLE_MATCH_THRESHOLD = Number(process.env.BACKEND_OFFICIAL_TRANSLATED_TITLE_MATCH_THRESHOLD || 0.40);
+const BACKEND_OFFICIAL_TITLE_MIN_MATCH_THRESHOLD = Number(process.env.BACKEND_OFFICIAL_TITLE_MIN_MATCH_THRESHOLD || 0.15);
+const BACKEND_OFFICIAL_TITLE_MATCH_STEP = Number(process.env.BACKEND_OFFICIAL_TITLE_MATCH_STEP || 0.05);
 const PRICE_IMAGE_MATCH_THRESHOLD = Number(process.env.PRICE_IMAGE_MATCH_THRESHOLD || 90);
 const PRICE_TITLE_AMBIGUITY_GAP = Number(process.env.PRICE_TITLE_AMBIGUITY_GAP || 0.08);
 const PRICE_TITLE_AMBIGUITY_STRICT_BELOW = Number(process.env.PRICE_TITLE_AMBIGUITY_STRICT_BELOW || STRICT_TITLE_MATCH_THRESHOLD);
@@ -1201,7 +1203,7 @@ function siteCompatible(left = {}, right = {}) {
 }
 
 function storeAndSiteCompatible(left = {}, right = {}) {
-  return storeCompatible(left, right) && hasSiteEvidence(left) && hasSiteEvidence(right) && siteCompatible(left, right);
+  return storeStrictlyCompatible(left, right) && hasSiteEvidence(left) && hasSiteEvidence(right) && siteCompatible(left, right);
 }
 
 function storeAndSiteStrictlyCompatible(left = {}, right = {}) {
@@ -1853,6 +1855,16 @@ function officialCandidatesForRow(row, officialRows, scope = 'store-site') {
   return officialRows.filter(official => matchScopeCompatible(scope, row, official));
 }
 
+function acceptedTitleThreshold(score, baseThreshold) {
+  const base = Math.max(0, Number(baseThreshold) || 0);
+  const min = Math.max(0, Math.min(base || 1, Number(BACKEND_OFFICIAL_TITLE_MIN_MATCH_THRESHOLD) || 0));
+  const step = Math.max(0.01, Number(BACKEND_OFFICIAL_TITLE_MATCH_STEP) || 0.05);
+  for (let threshold = base; threshold >= min - 0.000001; threshold -= step) {
+    if (score >= threshold) return threshold;
+  }
+  return null;
+}
+
 function bestOfficialTitleMatchForRow(row, officialRows, threshold = BACKEND_OFFICIAL_TITLE_MATCH_THRESHOLD) {
   const rowTitles = titleCandidateItemsForRow(row);
   if (!rowTitles.length) return null;
@@ -1893,7 +1905,7 @@ function bestOfficialTitleMatchForRow(row, officialRows, threshold = BACKEND_OFF
   const ambiguous = runnerUp &&
     best.score < PRICE_TITLE_AMBIGUITY_STRICT_BELOW &&
     best.score - runnerUp.score < PRICE_TITLE_AMBIGUITY_GAP;
-  return best.score >= requiredScore && !ambiguous
+  return acceptedTitleThreshold(best.score, requiredScore) !== null && !ambiguous
     ? { official: best.official, score: Math.round(best.score * 100), matchStatus: best.matchStatus || '标题模糊匹配' }
     : null;
 }
@@ -1932,7 +1944,7 @@ function sameStoreWeakTitleOfficialMatch(row, officialRows, threshold = SAME_STO
       bestScore = score;
     }
   }
-  return bestOfficial && bestScore >= threshold
+  return bestOfficial && acceptedTitleThreshold(bestScore, threshold) !== null
     ? { official: bestOfficial, score: Math.round(bestScore * 100), matchStatus: '店铺标题弱匹配' }
     : null;
 }
@@ -1973,7 +1985,7 @@ function bestRowMatchForOfficial(official, rows, scope = 'store-site') {
       }
     }
     const threshold = usedTranslation ? BACKEND_OFFICIAL_TRANSLATED_TITLE_MATCH_THRESHOLD : BACKEND_OFFICIAL_TITLE_MATCH_THRESHOLD;
-    if (bestTitleScore >= threshold && (!best || bestTitleScore > best.score)) {
+    if (acceptedTitleThreshold(bestTitleScore, threshold) !== null && (!best || bestTitleScore > best.score)) {
       best = {
         row,
         matchStatus: usedTranslation ? '翻译标题匹配' : bestTitleScore >= STRICT_TITLE_MATCH_THRESHOLD ? '标题匹配' : '标题模糊匹配',
