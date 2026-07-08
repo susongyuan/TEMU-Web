@@ -916,6 +916,12 @@ async function mergePersistedTemuOfficialProducts(data, connection) {
 async function mergePersistedTemuBackendProducts(data, connection) {
   if (String(data.mode) !== 'price') return data;
 
+  const incomingBackendSource = data.sources?.temu_backend || {};
+  const incomingBackendRows = Number(data.summary?.temu_backend_rows || 0);
+  if (incomingBackendRows > 0 || incomingBackendSource.file || incomingBackendSource.type) {
+    return data;
+  }
+
   const backendRows = await loadTemuBackendProducts(connection);
   if (!backendRows.length) return data;
 
